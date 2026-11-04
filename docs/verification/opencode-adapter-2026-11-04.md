@@ -118,6 +118,39 @@ Result: the deployed `relay.mjs` started under that node and completed a real `j
 against the installed LCU, proving the deployed copy executes outside the repo tree and
 that the import rewrite is sound at runtime.
 
+### On-machine checks through the live relay (2026-11-04, post-implementation)
+
+Method: a stdio JSON-RPC probe drove `relay.mjs` against the installed LCU 0.13.5 with the
+user at the computer, plus the relay's own diagnostic log
+(`~/Library/Logs/LCU/opencode-*.jsonl`).
+
+- `approval_auto_accepted` was logged for `com.apple.ActivityMonitor` with the tool
+  metadata (`connector_id: computer-use`, `riskLevel`), and no tool arguments or results
+  appear in the log (checked: every line lacks an `args`/`code` field).
+- A real screenshot of Typora's window through the relay returned a 39,271-byte PNG to the
+  model (E2 semantics through the relay, after the earlier bare-registration screenshot
+  had passed with 211,946 bytes).
+- `js_reset` passed through and reported success; the worker-turn Interrupt bookkeeping
+  inside the shared client ran under it.
+- Targeting `ai.opencode.desktop` (OpenCode itself) was not completed live: the attempt
+  hit a kernel-level crash in the runtime before the guard answered; the host-guard
+  refusal for agent-host apps is covered by the committed unit tests instead
+  (`adapters/opencode/test/relay-core.test.mjs`), and `ai.opencode.desktop` is in the
+  shared guard's static list.
+
+### Finding: `cgWindowNotFound` when the user is away
+
+Repeated `-10005: cgWindowNotFound` failures on `getApp` bindings (Activity Monitor,
+Mail, Typora, WeChat) while Finder's Desktop always bound were traced to the machine's
+state, not to the adapter: with the user away (screen locked), regular apps' windows are
+not on screen, and the runtime's window lookup fails with `-10005`; the shared client's
+`CGWindowListCopyWindowInfo(.optionAll)` probe still lists those windows across Spaces,
+so a window-listing probe alone is misleading. A Finder bind (the Desktop is always
+present) is the control case. Bindings succeed again as soon as the user returns and the
+window is on screen (verified live for Typora, above). Consequence for agents: treat
+`cgWindowNotFound` on bind as "target window is not on screen (locked screen, other
+Space, or closed window)", not as a permission or adapter failure.
+
 ### Test statistics (this tree, 2026-11-04)
 
 - `node --test adapters/opencode/test/`: 63 tests, 63 pass, 0 fail, 0 skipped.

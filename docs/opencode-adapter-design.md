@@ -422,7 +422,7 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 | M1（已完成，2026-11-04） | E1–E4 实验 | 本文档 §2.2（E1 失败裁定 → v0.4） | — |
 | M2（已完成，2026-11-04，`363923c`） | Relay 核心（工具过滤 + 审批策略 + turn 管理 + 单例锁） | `adapters/opencode/relay.mjs` + 单测 | 1 天 |
 | M3（已完成，2026-11-04，`69a07ed`；安装脚本随阶段 3 提前交付，`c13aa9b`） | 插件 + 生命周期打通 | `adapters/opencode/plugin/` + IPC 互操作验收 | 0.5–1 天 |
-| M4（文档完成，2026-11-04：`adapters/opencode/README.md` + `docs/verification/opencode-adapter-2026-11-04.md`；实机清单待 OpenCode 重启后执行） | 实机验证清单跑通 | verification record | 0.5 天 |
+| M4（文档完成 + 实机部分完成，2026-11-04：README + verification record；实机已验：E2 经 relay、审批 auto-accept 日志、js_reset、单例 standby、IPC 互操作、cgWindowNotFound=锁屏/窗口不在屏 定位；剩余：真实 Desktop 会话全流程，待重启切换 relay 后日常观察） | 实机验证清单跑通 | verification record | 0.5 天 |
 | M5（部分完成：安装脚本已随阶段 3 交付，`c13aa9b`；PR 上游未开始） | 打包安装脚本 + PR 上游 | 发布物 | 0.5–1 天 |
 
 ### 8.1 实现与设计的偏差（阶段 1–3 验收时记录）
