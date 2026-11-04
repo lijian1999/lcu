@@ -141,6 +141,33 @@ then; until that restart, a working session can still be blocked by an idle owne
 another directory (workaround: quit OpenCode and reopen, or kill the owner pid named in
 the in-use error).
 
+### Code Mode description truncation (found in production sessions)
+
+The two user sessions that flailed with LCU (`ses_e59f0c6a4ffe`, `ses_e5a1b7bedffe`,
+18:15–18:18 local) ran through Code Mode, where OpenCode truncates MCP tool descriptions
+to roughly 110–120 characters. The upstream `js` description (1,511 chars) carries the
+rules those sessions needed — the first invocation must run exactly one documented API
+call so its result includes the guide; output goes through `nodeRepl.write()`; browser
+APIs are disabled — and none of them survived truncation. The model probed bare
+trailing expressions (recorded `null` results), then the raw `computer.get_app_state`
+surface (approval arg-shape errors: "requires an object input", "requires app to be a
+plain data property"), and only recovered after reading `String(cua.getApp)` and
+switching to the documented `getApp` + AX flow; the task did complete.
+
+Also measured for the record: the upstream server instructions are a single line
+("UI automation through cua_repl using the initialized cua API.", 61 chars) — the relay
+forwards them verbatim, so instruction delivery is at parity with bare registration; the
+guide itself reaches the model only inside `js` results (first-use display), which is why
+the description prefix (relay commit "truncation-surviving prefix") front-loads the three
+rules into the truncated window.
+
+### Graceful shutdown under production (observed)
+
+When OpenCode quits, every relay across project directories receives SIGTERM and exits
+with code 0 (`relay_stop reason=SIGTERM` in each diagnostic log; OpenCode's MCP transport
+errors read "MCP server process exited with code 0"). The exit drain and singleton file
+cleanup behaved under a four-directory teardown.
+
 Known cosmetic quirk from the same deployment: OpenCode snapshots MCP tool descriptions
 when it connects, so a directory whose relay was a standby at startup keeps showing the
 standby tool description ("calls are refused…") even after its relay takes over; calls
