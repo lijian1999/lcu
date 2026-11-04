@@ -62,7 +62,7 @@ test('the token file is private, replaced per owner, and readable back', () => {
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
-test('a second relay beside the owner serves standby descriptors and refuses its calls with the owner pid', async () => {
+test('a second relay beside the owner inherits its descriptors and refuses its calls with the owner pid', async () => {
   const directory = makeTempDirectory('lcu-opencode-standby-');
   const logPath = join(directory, 'fixture.jsonl');
   try {
@@ -78,9 +78,11 @@ test('a second relay beside the owner serves standby descriptors and refuses its
         assert.equal(standby.socketPath, undefined, 'the standby serves no socket');
         assert.deepEqual(ownerLog.events[0], { event: 'relay_start', role: 'owner', pid: process.pid, lcu: FIXTURE_PATH });
         assert.deepEqual(standbyLog.events[0], { event: 'relay_start', role: 'standby', pid: process.pid, lcu: FIXTURE_PATH });
+        // The standby asks the owner over IPC: the model sees the real descriptors (and the
+        // initialize answer carried the owner's instructions), not the static fallback list.
         const listed = await host.client.listTools();
         assert.deepEqual(listed.tools.map(tool => tool.name), ['js', 'js_reset']);
-        assert.match(listed.tools[0].description, /standby/);
+        assert.equal(listed.tools[0].description, 'Fixture JS description.');
         // D3.1: an idle owner would yield to this caller, so the refusal scenario here is an
         // owner with no yield channel (its token file is gone): the takeover falls back to
         // the plain in-use error.
@@ -91,7 +93,8 @@ test('a second relay beside the owner serves standby descriptors and refuses its
           new RegExp(`^LCU is in use by another OpenCode session \\(owner pid ${process.pid}\\)\\. ` +
             'Switch to that OpenCode window or close it, then retry here\\.$'));
         assert.equal(standby.role, 'standby', 'the takeover was refused');
-        assert.equal(readFixtureLog(logPath).length, 0, 'a standby refusal never reaches the upstream');
+        assert.equal(readFixtureLog(logPath).filter(entry => entry.name === 'js' || entry.name === 'turn_ended').length, 0,
+          'a standby refusal never reaches the upstream');
       } finally {
         await host.close();
         // The owner goes first so its cleanup cannot touch the standby's files; the standby

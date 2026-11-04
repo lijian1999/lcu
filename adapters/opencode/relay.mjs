@@ -5,8 +5,12 @@
 // second session while one is using the runtime, answers approval elicitations itself (accept,
 // except when the host guard in the client refuses an agent-hosting app), and ends turns when
 // the OpenCode lifecycle plugin reports bind/turn_ended over a private token-gated Unix socket.
-// It is a per-state-directory singleton: the first relay wins and owns the socket, later ones
-// serve static standby descriptors and try to take the lock over on each call. A standby whose
+// The owner connects its upstream eagerly (in the background) so its initialize answer can
+// carry the upstream's instructions — OpenCode injects them into the system prompt, and they
+// are how the model learns the cua API's correct use; a standby inherits the instructions and
+// the tool descriptors from the owner over the same socket. It is a per-state-directory
+// singleton: the first relay wins and owns the socket, later ones ask it for both and try to
+// take the lock over on each call. A standby whose
 // lock attempt finds a live owner asks that owner to yield (D3.1): an idle owner ends its open
 // turns, closes its upstream and IPC surface, and steps down to standby so the caller can take
 // over — an owner with a call in flight refuses with `busy` and keeps the runtime.
@@ -17,7 +21,7 @@ import { accessSync, constants, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolRequestSchema, ErrorCode, InitializeRequestSchema, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { createCuaClient, isMainModule, MODEL_TOOLS, TURN_CLEANUP_TIMEOUT_CODE } from '../client.mjs';
 import { openDiagnosticLog } from '../diagnostics.mjs';
 import { ipcRequest, startIpcServer } from './ipc.mjs';
@@ -35,6 +39,22 @@ export const YIELD_TIMEOUT_MS = 1_000;
 /** Lock attempts after a yield reply, spaced out; O_EXCL arbitrates concurrent standbys. */
 export const TAKEOVER_ATTEMPTS = 3;
 export const TAKEOVER_RETRY_DELAY_MS = 100;
+
+/** The owner's initialize answer waits this long for its upstream connect before degrading to
+ * no instructions. It must stay under OpenCode's default 30 s MCP startup budget. */
+export const INITIALIZE_INSTRUCTIONS_TIMEOUT_MS = 20_000;
+/** The owner waits this long for its upstream when a standby asks for the instructions over IPC. */
+export const OWNER_INSTRUCTIONS_WAIT_MS = 30_000;
+/** One standby→owner IPC attempt waits this long; two attempts stay inside OpenCode's 30 s budget. */
+export const STANDBY_OWNER_TIMEOUT_MS = 10_000;
+/** Gap between the two standby→owner attempts, so a takeover that just finished — and with it
+ * its fresh token file — is seen by the retry. */
+export const STANDBY_RETRY_DELAY_MS = 250;
+/** The standby's tools ask; the owner answers at once or reports itself not ready. */
+export const STANDBY_TOOLS_TIMEOUT_MS = 3_000;
+
+/** Code of the error `withDeadline` rejects with when its timer wins the race. */
+export const WAIT_DEADLINE_CODE = 'LCU_WAIT_DEADLINE';
 
 const SERVER_INFO = { name: 'lcu-opencode-relay', version: '0.1.0' };
 const SESSION_ID_META = 'ai.opencode/sessionID';
@@ -92,6 +112,23 @@ const asText = error => (error instanceof Error ? error.message : String(error))
 const errorResult = text => ({ isError: true, content: [{ type: 'text', text }] });
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+/**
+ * `promise` racing a deadline. The timer is cleared whichever side settles first, and a
+ * deadline loss leaves `promise` running: the caller degrades while the work (an upstream
+ * connect still in flight) continues in the background.
+ */
+function withDeadline(promise, ms, label) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`waited ${ms} ms for ${label}`);
+      error.code = WAIT_DEADLINE_CODE;
+      reject(error);
+    }, ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
 /** The v0.4 approval policy: accept every elicitation the client's guard let through, log the metadata. */
 export function createApprovalPolicy(log) {
   return async params => {
@@ -142,12 +179,14 @@ export async function createRelay({
   let ownerPid = election.acquired ? pid : election.pid;
   log.event('relay_start', { role, pid, lcu: lcuPath });
 
-  // The upstream LCU client, connected lazily on the first tools/list or tools/call. The
-  // epoch invalidates a connect that is still running when the owner yields (or disposes):
-  // the loser re-checks and stands down instead of marking a closed client ready.
+  // The upstream LCU client, connected eagerly on the owner (in the background) and on the
+  // first tools/call otherwise. The epoch invalidates a connect that is still running when
+  // the owner yields (or disposes): the loser re-checks and stands down — closing the client
+  // it captured — instead of marking a closed client ready.
   let upstream;
   let upstreamReady = false;
   let connecting;
+  let connectingEpoch;
   let upstreamEpoch = 0;
   // Owner-only services: the lifecycle IPC server.
   let ipc;
@@ -161,28 +200,58 @@ export async function createRelay({
 
   function ensureUpstream() {
     if (upstreamReady) return upstream;
-    if (!connecting) {
-      const epoch = upstreamEpoch;
-      connecting = (async () => {
-        try {
-          upstream ??= createCuaClient({ command: [lcuPath], adapter: 'opencode', log, onElicitation: approvalPolicy });
-          await upstream.connect();
-          if (epoch !== upstreamEpoch) {
-            await upstream.close().catch(() => {});
-            throw new Error('the relay stepped down while connecting');
-          }
-          upstreamReady = true;
-          return upstream;
-        } catch {
-          log.event('upstream_unavailable', {});
-          throw new Error('LCU could not be reached. Check that LCU is installed and try `lcu doctor`; ' +
-            'then restart OpenCode and retry.');
-        } finally {
-          connecting = undefined;
+    // A pending connect started under an older epoch (the owner stepped down while it ran)
+    // would only resolve into a closed client: supersede it with a fresh attempt instead of
+    // handing the caller its eventual failure. The loser still closes the client it captured.
+    if (connecting && connectingEpoch === upstreamEpoch) return connecting;
+    const epoch = upstreamEpoch;
+    const run = (async () => {
+      // The client is captured locally: a yield nulls the shared variable mid-connect, and
+      // the stand-down below must still close the client this attempt started.
+      const client = upstream ?? createCuaClient({ command: [lcuPath], adapter: 'opencode', log, onElicitation: approvalPolicy });
+      upstream = client;
+      try {
+        await client.connect();
+        if (epoch !== upstreamEpoch) {
+          await client.close().catch(() => {});
+          throw new Error('the relay stepped down while connecting');
         }
-      })();
+        upstreamReady = true;
+        return upstream;
+      } catch {
+        log.event('upstream_unavailable', {});
+        // A failed connect closes the client for good, so a later attempt must build a fresh
+        // one — unless a newer attempt already replaced the shared variable.
+        if (upstream === client) upstream = undefined;
+        throw new Error('LCU could not be reached. Check that LCU is installed and try `lcu doctor`; ' +
+          'then restart OpenCode and retry.');
+      }
+    })();
+    connecting = run;
+    connectingEpoch = epoch;
+    const settle = () => {
+      if (connecting === run) {
+        connecting = undefined;
+        connectingEpoch = undefined;
+      }
+    };
+    run.then(settle, settle);
+    return run;
+  }
+
+  /**
+   * The instructions an initialize answer carries: the upstream's once it is connected, or ''
+   * (the relay stays serveable either way). Serves the owner's own initialize answer and a
+   * standby's IPC request; the deadline only bounds the wait, never the connect itself.
+   */
+  async function ownerInstructions(timeoutMs) {
+    try {
+      const client = await withDeadline(ensureUpstream(), timeoutMs, 'the upstream connection');
+      return client.instructions ?? '';
+    } catch (error) {
+      log.event('instructions_unavailable', { timedOut: error?.code === WAIT_DEADLINE_CODE });
+      return '';
     }
-    return connecting;
   }
 
   /**
@@ -242,6 +311,33 @@ export async function createRelay({
   }
 
   /**
+   * IPC `instructions`: a standby's initialize asks for the upstream guide. The owner waits
+   * for its own (eager) connect — normally a few hundred milliseconds — and answers
+   * `not_owner` when it stepped down meanwhile, so the standby retries against its successor.
+   */
+  async function onInstructionsRequest() {
+    if (role !== 'owner') return { ok: false, error: 'not_owner' };
+    const instructions = await ownerInstructions(OWNER_INSTRUCTIONS_WAIT_MS);
+    if (role !== 'owner') return { ok: false, error: 'not_owner' };
+    return { ok: true, instructions };
+  }
+
+  /**
+   * IPC `tools`: a standby's tools/list asks for the owner's descriptors. A not-yet-connected
+   * owner reports itself unavailable at once — the standby serves its static list instead of
+   * waiting, and a later list retries.
+   */
+  function onToolsRequest() {
+    if (role !== 'owner') return { ok: false, error: 'not_owner' };
+    if (!upstreamReady) return { ok: false, error: 'unavailable' };
+    try {
+      return { ok: true, tools: upstream.publicTools() };
+    } catch {
+      return { ok: false, error: 'unavailable' };
+    }
+  }
+
+  /**
    * IPC `yield`: a standby that is trying to take over asks this owner to step down. The
    * owner refuses with `busy` while any call is in flight — or while its own takeover is
    * still upgrading, or while a step-down is already running. Otherwise it ends every open
@@ -294,6 +390,10 @@ export async function createRelay({
         return onTurnEnded(message.sessionID, message.event);
       case 'yield':
         return onYield();
+      case 'instructions':
+        return onInstructionsRequest();
+      case 'tools':
+        return onToolsRequest();
     }
     return { ok: false, error: 'bad_request' };
   };
@@ -307,7 +407,57 @@ export async function createRelay({
     }
   }
 
-  if (role === 'owner') await startOwnerServices();
+  if (role === 'owner') {
+    await startOwnerServices();
+    // Eager upstream connect, in the background: the initialize answer and a standby's
+    // instructions request wait for it briefly, and the runtime is warm before the first call.
+    void ensureUpstream().catch(() => {});
+  }
+
+  // What a standby learned from the owner, cached: initialize and tools/list each ask once,
+  // because the answers cannot change before this relay takes the runtime over itself.
+  let cachedInstructions;
+  let cachedTools;
+
+  /**
+   * Ask the current owner over the token-gated socket, twice. The first attempt can land on
+   * an owner that is stepping down — its token and socket are gone, or it answers
+   * `not_owner` — and the retry re-reads both and reaches its successor. `undefined` means
+   * nobody answerable (degrade to the standby defaults).
+   */
+  async function askOwner(message, { timeoutMs }) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (attempt > 0) await delay(STANDBY_RETRY_DELAY_MS);
+      const token = readToken(join(stateDir, TOKEN_NAME));
+      if (token === undefined || !existsSync(socketPath)) continue;
+      try {
+        const response = await ipcRequest(socketPath, { token, ...message }, { timeoutMs });
+        if (response.ok) return response;
+      } catch { /* the retry reaches the next owner */ }
+    }
+    return undefined;
+  }
+
+  /** The instructions a standby's initialize answer carries: the owner's, or '' when unreachable. */
+  async function standbyInstructions() {
+    if (cachedInstructions !== undefined) return cachedInstructions;
+    const response = await askOwner({ type: 'instructions' }, { timeoutMs: STANDBY_OWNER_TIMEOUT_MS });
+    if (response === undefined || typeof response.instructions !== 'string') {
+      log.event('instructions_unavailable', { fromOwner: false });
+      return '';
+    }
+    cachedInstructions = response.instructions;
+    return cachedInstructions;
+  }
+
+  /** The descriptors a standby's tools/list serves: the owner's once, else the static list. */
+  async function standbyToolList() {
+    if (cachedTools !== undefined) return cachedTools;
+    const response = await askOwner({ type: 'tools' }, { timeoutMs: STANDBY_TOOLS_TIMEOUT_MS });
+    if (response === undefined || !Array.isArray(response.tools)) return undefined;
+    cachedTools = response.tools;
+    return cachedTools;
+  }
 
   /**
    * Ask the current owner (per the token and socket files) to step down so this relay can
@@ -415,14 +565,30 @@ export async function createRelay({
 
   const server = new Server(SERVER_INFO, {
     capabilities: { tools: {} },
-    // The relay connects to LCU lazily, so initialization always precedes the connection and
-    // the js tool description carries the cua_repl guide instead (v0.4 accepts this).
+    // The stock value is empty; the initialize handler below supplies the upstream's real
+    // instructions (or none, before it connected).
     instructions: '',
   });
   server.onerror = error => console.error('LCU OpenCode relay server error:', asText(error));
 
+  // Bare-registration parity: OpenCode injects the server's instructions into the system
+  // prompt, and the cua guide they carry is how the model learns the js API's correct use.
+  // `setRequestHandler` replaces the SDK's built-in initialize handler (documented override
+  // point); delegating to `_oninitialize` keeps the protocol-version negotiation and client
+  // bookkeeping exact while the answer waits, briefly, for the upstream connect.
+  server.setRequestHandler(InitializeRequestSchema, async request => {
+    const base = await server._oninitialize(request);
+    const instructions = role === 'owner'
+      ? await ownerInstructions(INITIALIZE_INSTRUCTIONS_TIMEOUT_MS)
+      : await standbyInstructions();
+    return instructions ? { ...base, instructions } : base;
+  });
+
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    if (role === 'standby') return { tools: STANDBY_TOOLS };
+    if (role === 'standby') {
+      const ownerTools = await standbyToolList();
+      return { tools: ownerTools ?? STANDBY_TOOLS };
+    }
     try {
       await ensureUpstream();
       return { tools: upstream.publicTools() };
@@ -466,6 +632,9 @@ export async function createRelay({
       try {
         await drainOpenTurns();
       } catch { /* each turn end reports its own outcome */ }
+      // Invalidate a connect still in flight, so its connector stands down and closes the
+      // client it captured instead of marking a disposed relay ready.
+      upstreamEpoch += 1;
       await upstream?.close().catch(() => {});
       await ipc?.close().catch(() => {});
       // Only the relay the lock still names removes the shared files. A standby — including
@@ -486,6 +655,9 @@ export async function createRelay({
     sessions,
     get role() { return role; },
     get ownerPid() { return ownerPid; },
+    // Whether the upstream client is connected; also the seam the yield-during-connect test
+    // uses to prove a step-down never leaves a zombie ready state behind.
+    get upstreamReady() { return upstreamReady; },
     get socketPath() { return role === 'owner' ? socketPath : undefined; },
     get tokenPath() { return join(stateDir, TOKEN_NAME); },
     get lockPath() { return join(stateDir, LOCK_NAME); },

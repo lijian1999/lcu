@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRelay } from '../relay.mjs';
 import { ipcRequest } from '../ipc.mjs';
@@ -199,8 +199,9 @@ test('after a yield the lock, token, and socket belong to the new owner', async 
     await withEnv('LCU_OPENCODE_FIXTURE_LOG', logPath, async () => {
       const pair = await openPair(directory);
       try {
-        // A never-called owner (the idle home-project relay of the production incident).
-        assert.equal(readFixtureLog(logPath).length, 0);
+        // A never-called owner (the idle home-project relay of the production incident); its
+        // eager upstream connect may have started the fixture, but no model call reached it.
+        assert.equal(readFixtureLog(logPath).filter(entry => entry.name === 'js' || entry.name === 'turn_ended').length, 0);
         const served = await pair.standbyHost.client.callTool({
           name: 'js', arguments: { code: 'take-it' }, _meta: sessionMeta('files-session'),
         });
@@ -213,7 +214,8 @@ test('after a yield the lock, token, and socket belong to the new owner', async 
           { ok: true, pid: STANDBY_PID, role: 'owner' });
         assert.notEqual(readToken(pair.standby.tokenPath), undefined, 'a fresh token file exists');
         const listed = await pair.ownerHost.client.listTools();
-        assert.match(listed.tools[0].description, /standby/, 'the stepped-down owner lists standby descriptors');
+        assert.equal(listed.tools[0].description, 'Fixture JS description.',
+          'the stepped-down relay inherits the new owner\'s descriptors');
       } finally {
         await closePair(pair);
       }
@@ -286,7 +288,11 @@ test('an unresponsive owner keeps the lock until it dies; then the stale lock is
       await once(blocker, 'listening');
       const standbyLog = captureLog();
       const standby = await createRelay({ lcuPath: FIXTURE_PATH, stateDir: directory, log: standbyLog, argv: RELAY_ARGV });
+      // A silent owner must not stall the standby's initialize ask, so the channel files are
+      // out of the way for it; the yield attempt below restores and uses them.
+      rmSync(join(directory, 'relay.token'), { force: true });
       const host = await connectHost(standby);
+      writeToken(directory);
       try {
         assert.equal(standby.role, 'standby');
         const refused = await host.client.callTool({ name: 'js', arguments: { code: 'x' }, _meta: sessionMeta('stale-session') });

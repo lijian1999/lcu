@@ -100,5 +100,17 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 });
 
 record({ type: 'fixture-start', pid: process.pid });
-process.stdin.on('end', () => process.exit(0));
+// `LCU_OPENCODE_FIXTURE_CRASH`: exit before the MCP handshake, so the relay's connect fails.
+if (process.env.LCU_OPENCODE_FIXTURE_CRASH) {
+  record({ type: 'fixture-crash', pid: process.pid });
+  process.exit(1);
+}
+// `LCU_OPENCODE_FIXTURE_SLOW_START_MS`: delay before the handshake completes, so tests can
+// hold a relay's upstream mid-connect (instruction waits, yield-during-connect races).
+const slowStart = Number(process.env.LCU_OPENCODE_FIXTURE_SLOW_START_MS ?? 0);
+if (slowStart > 0) await new Promise(resolve => setTimeout(resolve, slowStart));
+process.stdin.on('end', () => {
+  record({ type: 'fixture-exit', pid: process.pid });
+  process.exit(0);
+});
 await server.connect(new StdioServerTransport());

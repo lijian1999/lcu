@@ -28,7 +28,7 @@ test('relay arguments parse, and the fallback identity is a stable per-connectio
   assert.notEqual(fallbackIdentity(['node', 'relay.mjs', '--lcu', '/other']), identity);
 });
 
-test('tools/list exposes exactly js/js_reset with the original descriptors, and no instructions yet', async () => {
+test('initialize forwards the upstream instructions, and tools/list the original descriptors', async () => {
   const directory = makeTempDirectory('lcu-opencode-list-');
   const logPath = join(directory, 'fixture.jsonl');
   try {
@@ -37,7 +37,8 @@ test('tools/list exposes exactly js/js_reset with the original descriptors, and 
       const relay = await createRelay({ lcuPath: FIXTURE_PATH, stateDir: directory, log, argv: RELAY_ARGV });
       const host = await connectHost(relay);
       try {
-        assert.equal(host.client.getInstructions() ?? '', '', 'the lazy upstream is not connected at initialize');
+        assert.equal(host.client.getInstructions() ?? '', 'Fixture CUA initialization guide.',
+          'the owner initialize answer waits for the eager connect and forwards the guide');
         const listed = await host.client.listTools();
         assert.deepEqual(listed.tools.map(tool => tool.name), ['js', 'js_reset']);
         assert.equal(listed.tools[0].description, 'Fixture JS description.');

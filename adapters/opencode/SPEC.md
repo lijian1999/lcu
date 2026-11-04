@@ -23,8 +23,8 @@
 启动流程：
 1. `--lcu` 路径必须存在且可执行（`fs.accessSync` X_OK），否则 stderr 打印并 exit 2。
 2. 尝试成为 **owner**：在 state-dir 下创建 `relay.lock`（`open(path, 'wx')` 写入 `{pid, startedAt}` JSON；`EEXIST` 时读出 pid，若该 pid 已死（`kill(pid, 0)` ESRCH）则删除陈旧锁重试一次，仍失败 → 进入 **standby** 模式）。
-3. **owner**：创建 `relay.token`（0600，32 字节随机 hex）与 `relay.sock`（Unix socket，先 unlink 旧文件）。启动诊断日志 `openDiagnosticLog({ adapter: 'opencode' })`。惰性连接上游（见 1.4）。打开 IPC 服务（见 1.6）。
-4. **standby**：不连上游、不开 IPC。照常响应 `initialize`/`tools/list`（静态 js/js_reset 描述符，见 1.5）；`tools/call` 时先尝试接管（重试 step 2 的锁获取；若锁被**活着的** owner 持有，先向其 sock 发 `{token, type:'yield'}`（token 从 `<state-dir>/relay.token` 读；无 sock/token → 直接 in-use 错误）：owner 回 `{ok:false, error:'busy'}` → 保持 standby，in-use 错误；owner 回 `{ok:true}`（或 `not_owner`）或无响应/超时（1s）→ 重试 acquire（最多 3 次、间隔 ~100ms；O_EXCL 天然仲裁并发 standby；锁在但进程死的清除沿用 step 2），成功则原地升级为 owner：建 token/sock/日志、连上游，然后继续处理本次调用），失败则返回 isError 文本：
+3. **owner**：创建 `relay.token`（0600，32 字节随机 hex）与 `relay.sock`（Unix socket，先 unlink 旧文件）。启动诊断日志 `openDiagnosticLog({ adapter: 'opencode' })`。打开 IPC 服务（见 1.6），随后**后台立即发起**上游连接（eager connect，`ensureUpstream()`，不阻塞启动；initialize 应答与 standby 的 instructions 请求会等它一小段——见 1.2；超时后连接继续在后台进行，后续 tools/call 照旧惰性重连）。
+4. **standby**：不连上游、不开 IPC。`initialize`/`tools/list` 先经 IPC 向 owner 索取（见 1.2/1.6），拿不到 → 现状行为（'' + 静态描述符）；`tools/call` 时先尝试接管（重试 step 2 的锁获取；若锁被**活着的** owner 持有，先向其 sock 发 `{token, type:'yield'}`（token 从 `<state-dir>/relay.token` 读；无 sock/token → 直接 in-use 错误）：owner 回 `{ok:false, error:'busy'}` → 保持 standby，in-use 错误；owner 回 `{ok:true}`（或 `not_owner`）或无响应/超时（1s）→ 重试 acquire（最多 3 次、间隔 ~100ms；O_EXCL 天然仲裁并发 standby；锁在但进程死的清除沿用 step 2），成功则原地升级为 owner：建 token/sock/日志、连上游，然后继续处理本次调用），失败则返回 isError 文本：
    `LCU is in use by another OpenCode session (owner pid <N>). Switch to that OpenCode window or close it, then retry here.`
 5. 诊断事件：`relay_start {role: 'owner'|'standby', pid, lcu}`；standby 接管成功记 `relay_takeover {waitedMs}`；owner 让位记 `relay_yield {openTurns}`。
 
@@ -32,8 +32,8 @@
 
 ### 1.2 MCP 方法面（对 OpenCode，SDK Server + StdioServerTransport）
 
-- `initialize`：`capabilities: { tools: {} }`；`instructions`：owner 已连上游时透传 `client.instructions`，否则空字符串（连接后不重发，可接受——js 工具描述自带 CUA 指南）。
-- `tools/list`：owner → 首次调用触发上游连接（`createCuaClient(...).connect()`，超时 `CONNECT_TIMEOUT_MS`），成功后透传 `publicTools()`（恰好 js/js_reset，含原始 description——CUA 指南在里面，**不得改写**）；上游连接失败 → 返回空 tools 列表 + 日志（不崩，下次调用重试连接）。standby → 静态最小描述符（name/只有 inputSchema 的 js/js_reset 镜像，硬编码在 relay 里即可）。
+- `initialize`：`capabilities: { tools: {} }`；`instructions`：**透传上游的 `client.instructions`**（OpenCode 会把它注入系统提示——模型学会 cua API 用法的关键，与 bare 注册对等）。owner：应答前等待 eager connect，上限 20s（OpenCode 的 MCP 启动预算 30s）；到点未连上或上游不可用 → instructions 置空，日志 `instructions_unavailable`，连接继续在后台进行。standby：经 IPC 向 owner 索取（见 1.6），结果缓存；owner 不在/超时 → ''。SDK 机制：`setRequestHandler(InitializeRequestSchema, …)` 覆盖内置 `_oninitialize`（文档明确"replace any previous handler"），应答 = `await server._oninitialize(request)` 的结果按需附加 `instructions` 字段（应答形状 `{protocolVersion, capabilities, serverInfo, instructions?}`，instructions 为空时不携带）。
+- `tools/list`：owner → 首次调用触发上游连接（`createCuaClient(...).connect()`，超时 `CONNECT_TIMEOUT_MS`），成功后透传 `publicTools()`（恰好 js/js_reset，含原始 description——CUA 指南在里面，**不得改写**）；上游连接失败 → 返回空 tools 列表 + 日志（不崩，下次调用重试连接）。standby → 经 IPC 向 owner 索取其 `publicTools()` 并缓存（owner 未连上/不在 → 回退静态最小描述符，见 1.5，下次 list 重试）。
 - `tools/call`：仅接受 `js`/`js_reset`，其余 → SDK 错误 `InvalidParams`/未知工具错误。处理流程见 1.3/1.7。
 - `resources/*`、`prompts/*` 等一律不支持（不声明 capability）。
 - **永不**向下发送 `elicitation/create`、`sampling` 等请求（v0.4：无审批呈现）。
@@ -73,7 +73,9 @@ const client = createCuaClient({
   - `{token, type:'bind', sessionID}` → `{ok:true, pid}`；语义：该 session 新一轮 prompt 开始——若该 session 已有 open turn：in-flight > 0 → `client.turnEnded({sessionId, turnId, event:'Interrupt'})`，否则 `'Stop'`；随后把该 session 的 turn 标记为已结束（下一个 js 来时新建 turn）。重复 bind（无 open turn）→ no-op `{ok:true}`。
   - `{token, type:'turn_ended', sessionID, event}`（event ∈ Stop|Interrupt，默认 Stop）→ 结束该 session 的 open turn（同上选择逻辑：in-flight > 0 或 event='Interrupt' → Interrupt）。
   - `{token, type:'ping'}` → `{ok:true, pid, role:'owner'}`（插件用于发现 owner）。
-  - `{token, type:'yield'}`（D3.1，standby 调用时的接管尝试触发——relay 绝不主动发，防乒乓）→ owner 判定：任一 session 的 in-flight 调用存在（或自身正在升级/正在让位）→ `{ok:false, error:'busy'}`（不释放）；否则执行**让位序列**：① 对所有 open turn 发 `Interrupt`（复用退出排空逻辑，2s 预算，失败不阻塞）；② 清空 open turn 簿记并关闭上游 client（`upstream?.close()`，upstreamReady=false）；③ 关闭自己的 IPC server（**不要**删除 sock 文件——新 owner 自行 unlink 重建；`ipc.close` 默认强断连接，让位路径须用优雅关闭让 `{ok:true}` 先送达）；④ 删除 `relay.token`，并仅当 `lockOwnedBy(stateDir, pid)` 时删除 `relay.lock`；⑤ `role='standby'`，日志 `relay_yield {openTurns}`；⑥ 回 `{ok:true}`。让位后 relay 继续存活、继续以 standby 服务它自己的 OpenCode 连接（下一次调用走接管路径）。已不是 owner（重复 yield / 正在让位）→ `{ok:false, error:'not_owner'}`。
+  - `{token, type:'yield'}`（D3.1，standby 调用时的接管尝试触发——relay 绝不主动发，防乒乓）→ owner 判定：任一 session 的 in-flight 调用存在（或自身正在升级/正在让位）→ `{ok:false, error:'busy'}`（不释放）；否则执行**让位序列**：① 对所有 open turn 发 `Interrupt`（复用退出排空逻辑，2s 预算，失败不阻塞）；② 清空 open turn 簿记并关闭上游 client（`upstream?.close()`，upstreamReady=false；若有 connect 仍在飞行，epoch 守卫使其自行退出并关闭自己启动的 client）；③ 关闭自己的 IPC server（**不要**删除 sock 文件——新 owner 自行 unlink 重建；`ipc.close` 默认强断连接，让位路径须用优雅关闭让 `{ok:true}` 先送达）；④ 删除 `relay.token`，并仅当 `lockOwnedBy(stateDir, pid)` 时删除 `relay.lock`；⑤ `role='standby'`，日志 `relay_yield {openTurns}`；⑥ 回 `{ok:true}`。让位后 relay 继续存活、继续以 standby 服务它自己的 OpenCode 连接（下一次调用走接管路径）。已不是 owner（重复 yield / 正在让位）→ `{ok:false, error:'not_owner'}`。
+  - `{token, type:'instructions'}`（standby 的 initialize 触发）→ owner 等待自己的上游连接（eager connect 通常几百 ms；上限 30s，超时回 `{ok:true, instructions:''}`）→ `{ok:true, instructions}`；等待期间或应答前让位/易主 → `{ok:false, error:'not_owner'}`（standby 收到后重试一次）。
+  - `{token, type:'tools'}`（standby 的 tools/list 触发）→ owner 已连上游 → `{ok:true, tools:[publicTools()]}`；未连上/不可用 → `{ok:false, error:'unavailable'}`（standby 回退静态描述符，不等待）。
   - 未知 type / 坏 JSON → `{ok:false, error:'bad_request'}` 并断开。
 - **失败重试语义**：`client.turnEnded` 抛 `LCU_TURN_CLEANUP_TIMEOUT` → 视为已受理（后台继续清理），open turn 照常结束，日志 `turn_end {outcome:'cleanup_timeout'}`；其他错误 → 该 session 记 `pendingEnd = {turnId, event}`，该 session 下一次 `js` 调用前先重试 turnEnded（成功才继续 js；仍失败 → isError `LCU is still finishing the previous turn`）。上游未连接时 turnEnded 直接忽略（client.mjs 行为）。
 - 插件侧不必等在本仓库实现（阶段 2），但 relay 侧先按此协议实现并单测。
@@ -147,6 +149,7 @@ async function approvalPolicy(params, { log }) {
   8. 单例：同 state-dir 起第二个 relay → standby；其 js 返回 in-use 文本；owner 锁文件删除（模拟崩溃）后 standby 下一次调用成功接管；D3.1 yield——空闲 owner 让位（open turn 被 `Interrupt`，锁/token/sock 归新 owner，旧 owner 的 MCP 连接以 standby 继续服务）、in-flight 时 owner 回 `busy`（in-use 文本不变）、对 standby 发 yield 得 `not_owner`、错误 token 被断开（in-use）、无响应 owner 保持锁直至其进程死亡后陈旧锁被清除。
   9. IPC：错误 token 被断开；bind/turn_ended/ping 各分支；`LCU_TURN_CLEANUP_TIMEOUT` 视为受理；
   10. 退出排空：SIGTERM → fixture 收到所有 open turn 的 Interrupt。
+- 指令透传（2026-11 修复）：owner initialize 应答携带 fixture 的 instructions（eager connect；上游启动慢时在预算内等到）；上游不可用 → initialize 正常返回 ''（不挂起），后续 tools/call 仍重试连接；standby initialize 携带 owner 转发的 instructions、tools/list 返回 owner 的完整描述符（缓存）；owner 不在 → 降级 '' + 静态描述符；ask 落在让位中的 owner 上 → 重试一次由新 owner 应答；owner 等待期间的 ask 在其连上后应答；eager connect 中让位 → 无僵尸 ready、无孤儿上游子进程。
 - 阶段 2 增测：事件映射表（假事件流 → 断言 IPC 消息）；节流告警。
 - **测试纪律**：不写真实文件到 HOME（state-dir 等一律注入 temp 目录）；不依赖网络；诊断日志用 `adapters/test/no-diagnostic-log.mjs` 同款禁用方式（先读）。
 
