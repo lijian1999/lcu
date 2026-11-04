@@ -1,8 +1,8 @@
 # LCU × OpenCode 适配器设计文档
 
-- 版本：v0.3（草案，含第一、二阶段实测数据）
+- 版本：v0.4（简化版裁定，含第一、二阶段实测数据）
 - 日期：2026-11-04
-- 状态：设计阶段，未实现；E1/E2 实验已完成，结论推翻了 v0.2 的两个关键假设
+- 状态：设计阶段，未实现；E1/E2 实验完成；用户裁定接受审批自动放行，审批呈现移出范围（§2.2.7），适配目标收敛为稳定性与防护
 - 目标平台：macOS（Apple Silicon）优先；Linux 为后续扩展
 - 涉及组件：LCU 0.13.5、OpenCode Desktop 2.2.5（`ai.opencode.desktop`）、ChatGPT.app 26.1027.61615（CUA 0.0.35）
 
@@ -21,7 +21,7 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 构建一个 **OpenCode 适配器**，使 OpenCode 满足 LCU 的完整宿主契约，达到官方适配器（Junie/Claude Code 级别）的行为对等：
 
 1. 模型通过 OpenCode 使用 `js`/`js_reset` 控制 macOS 桌面应用与浏览器；
-2. 逐应用审批（macOS elicitation）由 OpenCode 原生呈现，用户真实作答；
+2. ~~逐应用审批（macOS elicitation）由 OpenCode 原生呈现，用户真实作答~~（v0.4 移除：E1 失败，用户裁定接受自动放行，改为中继策略化自动接受 + host-guard 硬拒绝，见 §2.2.7）；
 3. 轮次生命周期（turn_ended）正确转发，浏览器临时标签等清理行为生效；
 4. host-guard 防自批准（拒绝控制 OpenCode 自身）；
 5. host-only 工具（`turn_ended`、`js_add_node_module_dir`）对模型不可见。
@@ -29,6 +29,7 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 ### 1.3 非目标（v1）
 
 - Chrome 控制（LCU 侧 opt-in，架构上预留，不实现）；
+- **审批呈现**（v0.4 裁定：自动接受，见 §2.2.7；上游若修复 elicitation 呈现可再评估）；
 - Windows（LCU 本身 deferred）；
 - Linux 沙箱状态（`codex/sandbox-state-meta`）处理——macOS 不受影响，中继应原样丢弃该 `_meta` 能力广播；
 - 与 LCU 官方 `lcu setup` 集成（LCU 不认识 opencode，见 §6.4 的边界处理）。
@@ -147,6 +148,27 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 
 **在适配器路线 1/2/3 落地前，不应认为"AI 控制任意 App"有审批闸**。临时缓解：保持"自动接受权限"关闭；不用时退出敏感 App（注意 `getApp` 可后台拉起 App，此缓解不彻底）；等待/推进路线 1。
 
+### 2.2.7 v0.4 范围裁定（用户决策，2026-11-04）
+
+用户知情决策：**接受逐应用审批被宿主静默放行的现状**——对个人使用场景，"自动接受"符合偏好，审批呈现（v0.2 §5.4 路线 1/2/3）整体移出适配器范围。由此适配目标收敛为四件 E1 影响不到的事：
+
+| 保留 | 理由（与审批无关的独立价值） |
+|---|---|
+| **单例中继 + 多会话互斥**（原 D3） | E4 实测的日常稳定性问题：多实例互断连接、内核状态随机丢失 |
+| **轮次生命周期 turn_ended**（原 §5.2） | 浏览器临时标签清理、后台动作停止；无宿主信号则永不打扫 |
+| **host-guard 防自批准**（原 D4，优先级提升） | 防 AI 控制 OpenCode 自身。其性质是**硬拒绝**而非"问你"，与审批呈现无关，在自动接受常态化后是唯一防失控闸 |
+| **host-only 工具过滤 + 结果透传 + 诊断日志**（原 D1/§5.5） | 收敛攻击面、保真图像字节、可审计 |
+
+| 移除 | 处置 |
+|---|---|
+| 审批表单呈现（原路线 1：`question` 表单映射） | 删除；上游修复后如需再启用，探针脚本（`/tmp/lcu_meta_probe.mjs` 思路）留作回归用例 |
+| 路线 2/3（上游跟踪、Junie 兜底） | 降级为文档备注：用户日常通过 `lcu apps allow`（Touch ID）维护放行清单，作为审计手段而非闸 |
+| `--approval auto` 相关讨论 | 自动接受即常态，无需该选项 |
+
+新增一项轻量工作：**审批"策略化"**——中继自动接受全部 elicitation，但 host-guard 命中时仍硬拒绝，并把每次审批的 `riskLevel`/目标 App 写入诊断日志（为未来"高风险才问"留接口，v0.4 只实现 auto）。
+
+**估时修订：3–4.5 天 → 约 2 天**（M2 砍掉审批呈现管线，M3 不变，M4 验证项减少）。
+
 ---
 
 ## 3. 总体架构
@@ -159,8 +181,8 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 │                                                                 │
 │  ┌───────────────────────┐        ┌──────────────────────────┐  │
 │  │ lcu-opencode-plugin   │        │ MCP client               │  │
-│  │ (in-process, TS)      │        │  elicitation → 原生表单   │  │
-│  │  session.hook(prompt) │        └───────────┬──────────────┘  │
+│  │ (in-process, TS)      │        │  elicitation → 中继策略应答│  │
+│  │  session.hook(prompt) │        │  (auto-accept + guard)   │  │
 │  │  event: execution.*   │                    │ stdio           │
 │  └───────────┬───────────┘                    │                 │
 └──────────────┼────────────────────────────────┼─────────────────┘
@@ -169,7 +191,7 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
                └───────────────────────►│ lcu-opencode-relay       │
                                         │ (stdio MCP server, mjs)  │
                                         │  tools/list 过滤          │
-                                        │  elicitation 转发+guard   │
+                                        │  elicitation 策略应答 + guard   │
                                         │  turn id 管理             │
                                         └───────────┬──────────────┘
                                                     │ stdio MCP
@@ -193,7 +215,7 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 | 插件内嵌共享客户端（Pi/Hermes 模式） | 需自建注入 | **✗ 不可行**：elicitation 只能从 MCP server 侧发起，插件注册的工具不是 MCP server，运行时的 `elicitation/create` 无从到达 OpenCode UI | ✓ 插件钩子 | **排除** |
 | **MCP 中继（Junie/Codex 模式）** | ✓ 透传 | ✓ 逐跳转发 elicitation | ✓ 需插件经 IPC 协助 | **采用** |
 
-理由：macOS 逐应用审批是 LCU 安全模型的根（approval boundary），任何不能呈现 elicitation 的方案在 macOS 上会静默 fail-closed 或被迫走 Junie 式"永久授权"降级，都不可接受。OpenCode 支持 elicitation，这是它优于 Junie 的根本原因，中继必须保住这条通路。
+理由（v0.4 修订）：macOS 逐应用审批曾是中继存在的根理由，E1 证伪后其权重下降，但中继仍因以下三点不可替代：**① 单例**——裸注册按目录多开实例互断连接（E4），唯一解是一个被所有目录共享的单例中继（文件锁）；**② 生命周期**——turn_ended 需要 OpenCode 插件事件经 IPC 送入中继，裸注册无从获得；**③ host-guard 与 host-only 过滤**——需要位于 MCP 链路上的组件执行。审批 elicitation 在中继内按 §5.4 策略自动应答（guard 优先），不再向上转发。
 
 ### 3.3 组件清单
 
@@ -285,48 +307,37 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 // opencode.json（安装脚本写入，保留其余字段）
 {
   "mcp": {
-    "servers": {
-      "lcu": {
-        "type": "local",
-        "command": ["<node>", "<prefix>/current/adapters/opencode/relay.mjs", "--lcu", "<prefix>/current/bin/lcu"],
-        "codemode": false,
-        "timeout": { "startup": 60000, "execution": 3600000 }
-      }
+    "lcu": {
+      "type": "local",
+      "command": ["<node>", "<prefix>/current/adapters/opencode/relay.mjs", "--lcu", "<prefix>/current/bin/lcu"],
+      "codemode": false,
+      "timeout": { "startup": 60000, "execution": 3600000 }
     }
   },
-  "plugins": ["<prefix>/current/adapters/opencode/plugin"],
-  "permissions": [
-    // D1 落地后为双保险；默认 ask，auto 模式（可选，参考 lcu setup --approval auto 语义）：
-    { "action": "lcu_js",       "resource": "*", "effect": "ask" },
-    { "action": "lcu_js_reset", "resource": "*", "effect": "ask" }
-  ]
+  "plugins": ["<prefix>/current/adapters/opencode/plugin"]
 }
 ```
 
 - `execution` 超时需 ≥ LCU 上游的 5 分钟上限 + 审批挂起时间；默认 12h 太长，收紧到 1h。
-- **不做** OpenCode 侧的 always-allow（`"effect": "allow"`）默认值：逐应用审批已在 elicitation 层把关，工具层再放行会削弱"每次调用可审计"。`--approval auto` 作为显式 opt-in（无人值守机）。
+- v0.4 **不写 permissions 条目**：审批已策略化（中继自动接受 + guard），工具层保持 OpenCode 默认行为；若用户在新会话中确认 OpenCode 对 MCP 工具有逐调用批准，可自行加 `"effect": "allow"` 免去重复确认（单实例中继下该批准只发生一次连接期）。
 
-### 5.4 审批管线（elicitation）
+### 5.4 审批策略（v0.4：策略化自动接受，替代原 elicitation 呈现管线）
 
 ```
 上游 elicitation/create
   → host-guard 检查（祖先 bundle + 静态名单）──命中──► decline（日志 agent_host_refused）
         │未命中
         ▼
-  中继转发原始请求（message、requestedSchema、_meta.connector_id/tool_params.app/_meta.persist）
+  中继按策略应答：accept（v0.4 固定 auto）
         ▼
-  OpenCode 原生表单（⚠️E1）
-        ▼
-  用户作答 → 中继映射：
-    accept                 → accept
-    accept + "记住"（persist 可用时） → accept + _meta.persist（scope 遵循运行时 _meta，不扩展）
-    decline / 关闭表单      → decline / cancel
-  ⚠️ 依赖实测：OpenCode 是否保留 _meta、表单 schema 兼容性、审批挂起期间
-     OpenCode 的工具调用超时是否停摆（LCU 契约要求停摆；若 OpenCode 强制超时，
-     需在 error 文本中告知模型"审批被超时打断，请重试"）
+  诊断日志记录：时间、目标 App（tool_params.app / connector_id）、riskLevel、耗时
 ```
 
-**降级路径**（E1 失败时，参照 Junie 模式）：中继 cancel 审批 + 在结果中追加提示块，让模型引导用户在终端运行 `lcu apps allow <App>`（Touch ID 确认）。此为 last resort，默认不启用。
+- **不再向上转发** elicitation 到 OpenCode（E1 已证伪其呈现能力，见 §2.2.3）。
+- `requestedSchema` 为空（实测），accept 时 `content` 传空对象即可。
+- `_meta.persist` 忽略：不代用户做"always"持久化；永久放行由用户经 `lcu apps allow`（Touch ID）自行管理，`lcu apps` 清单作为审计面。
+- 配置项 `LCU_OPENCODE_APPROVAL`：v0.4 仅实现 `auto`；保留 `riskLevel: high` 时**仍自动接受但打醒目日志**的未来升级位（高风险才问，属后续可选迭代）。
+- 运行时硬拒绝清单（Terminal/iTerm2 等）由 LCU 自行拒绝，中继不干预。
 
 ### 5.5 结果透传规则
 
@@ -363,7 +374,7 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 ### 6.1 单元测试（Node，仿 `adapters/test/*.mjs`）
 
 - 工具过滤：`tools/list` 恰好含 `js`/`js_reset`；host-only 直呼被拒。
-- 审批映射：accept/persist/decline/cancel 全分支；guard 命中分支；审批挂起超时语义。
+- 审批策略：guard 未命中 → auto-accept 全分支（含 `riskLevel` 记录）；guard 命中 → decline；`requestedSchema` 空 schema 的应答格式。
 - turn 生命周期：bind/Stop/Interrupt/重试/会话切换/退出排空；`js_reset` 前置 Interrupt。
 - 容量与淘汰：1024/65536 边界。
 - 身份：缺失 `_meta` → identity_refused；跨会话并发 → 拒绝 + 文案。
@@ -376,11 +387,11 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 ### 6.3 实机验证清单（通过后才允许声称）
 
 1. ✅（已验）MCP 连接与指令交付
-2. ⚠️ E1 审批表单弹出 + 用户作答 + 审批后动作成功
-3. ⚠️ E2 截图 PNG 字节完整进模型（SHA-256 对照）
+2. ✅（已验，2026-11-04）E2 截图 PNG 字节完整进模型（211,946 字节，目视核对；SHA-256 对照可后补）
+3. ⚠️ 审批策略：裸注册下已验证"elicitation 发出 + fail-closed"；中继落地后验证 guard 命中拒绝 + auto-accept 记录
 4. Stop 后浏览器临时标签清理（需启用 Chrome 后测）
-5. Esc → `Interrupt` → 活跃调用被取消、pending 审批撤销
-6. 双会话互斥与恢复
+5. Esc → `Interrupt` → 活跃调用被取消
+6. 单例中继：第二目录接入时得到明确"占用中"错误而非争抢
 7. host-guard：尝试控制 OpenCode 自身被拒
 8. `js_reset` 后新调用正常、无 event-taps 残留
 
@@ -395,30 +406,32 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 
 | # | 风险 | 影响 | 缓解 |
 |---|------|------|------|
-| R1 | OpenCode elicitation 与 LCU 表单形状不兼容（E1 失败） | 审批不可用 → 桌面功能在 macOS 不可用 | §5.4 降级路径；或等 OpenCode elicitation 成熟；这是 go/no-go 决策点 |
-| R2 | 审批挂起期间 OpenCode 强制超时 | 长审批被打断 | error 文案引导重试；向 OpenCode 提 issue |
+| ~~R1~~ | ~~elicitation 呈现不兼容~~ | 已发生并裁定（E1 失败 → v0.4 策略化自动接受），风险关闭 | §5.4；上游修复后可重评 |
+| ~~R2~~ | ~~审批挂起期间强制超时~~ | 随 R1 关闭（不再有审批挂起） | — |
 | R3 | LCU 适配器契约漂移（0.13.x 迭代快） | 持续维护成本 | 复用其 `client.mjs`/`diagnostics.mjs` 减少自研面；锁定已测版本；跟踪 release notes |
 | R4 | OpenCode plugin/MCP API 变更 | 插件失效 | 版本门槛 + 能力探测降级（D5） |
 | R5 | `session.execution.*` 事件粒度不足（Q1） | turn_ended 误发/漏发 | 双策略实现 + 配置切换（§5.2） |
 | R6 | 无上游背书，问题自担 | 排查成本 | 诊断日志 + 对齐 LCU 验证文化；最终走路线 C（提 PR）换长期维护 |
+| R7（新） | 自动接受常态化后，误操作面扩大（AI 可静默控制任意 App） | 数据/设置被误改 | host-guard 硬拒绝宿主自身；运行时硬拒绝清单仍有效；诊断日志全量可审计；用户以 `lcu apps` 审计放行清单；文档明示该姿态 |
 
 ## 8. 里程碑估算
 
 | 阶段 | 内容 | 产出 | 估时 |
 |------|------|------|------|
 | M0（已完成） | 裸注册 + 第一阶段实测 | 本文档 §2 | — |
-| M1 | E1–E4 实验（权限修复后） | go/no-go 结论 | 0.5 天 |
-| M2 | Relay 核心（过滤/审批/turn） | 可用的中继 + 单测 | 1–1.5 天 |
+| M1（已完成，2026-11-04） | E1–E4 实验 | 本文档 §2.2（E1 失败裁定 → v0.4） | — |
+| M2 | Relay 核心（工具过滤 + 审批策略 + turn 管理 + 单例锁） | 可用的中继 + 单测 | 1 天 |
 | M3 | 插件 + 生命周期打通 | 完整轮次清理 | 0.5–1 天 |
 | M4 | 实机验证清单跑通 | verification record | 0.5 天 |
 | M5（可选） | 打包安装脚本 + PR 上游 | 发布物 | 0.5–1 天 |
 
-**合计：约 3–4.5 天**（单人，熟悉两边代码库的前提下）。
+**合计：约 2–2.5 天**（v0.4 简化范围；原 3–4.5 天）。
 
 ## 9. 开放问题
 
 - Q1：`session.execution.*` 事件与轮次边界的精确映射（待对照 OpenAPI schema + 实测）。
-- Q2：OpenCode MCP 连接的多会话复用模型（E4）——决定中继并发设计的最终形态。
+- Q2（已部分回答，2026-11-04）：OpenCode 按项目目录各启动一份 MCP 服务器（E4）；单例中继的部署形态（全局固定路径 + 文件锁）待 M2 实现验证。
 - Q3：OpenCode 是否支持 MCP progress 通知（Codex 中继用它保进度；缺失则长任务无中间反馈，非阻塞）。
-- Q4：OpenCode Desktop 与 CLI 的 elicitation 呈现差异（Claude 生态的前车之鉴：desktop app 可能没有 elicitation 回调）。
+- Q4（已回答）：OpenCode Desktop 2.2.5 **不呈现** `mcp-elicitation` 表单且静默自动接受（§2.2.3）；跟踪上游 #51856/#23066，若未来修复可重评审批呈现。
 - Q5：是否值得在上游定义 "generic MCP host" 最小契约，让 OpenCode 适配从"自研"转为"官方支持"。
+- Q6（新）：当前会话内 OpenCode 对 MCP 工具调用（lcu js）未弹批准——"自动接受权限"关闭后新会话是否恢复逐调用批准，待复测；若恢复，M2 配置模板可考虑加 `"effect": "allow"` 免重复确认（§5.3）。
