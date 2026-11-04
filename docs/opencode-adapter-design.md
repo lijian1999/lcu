@@ -413,6 +413,7 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 | R5 | `session.execution.*` 事件粒度不足（Q1） | turn_ended 误发/漏发 | 双策略实现 + 配置切换（§5.2） |
 | R6 | 无上游背书，问题自担 | 排查成本 | 诊断日志 + 对齐 LCU 验证文化；最终走路线 C（提 PR）换长期维护 |
 | R7（新） | 自动接受常态化后，误操作面扩大（AI 可静默控制任意 App） | 数据/设置被误改 | host-guard 硬拒绝宿主自身；运行时硬拒绝清单仍有效；诊断日志全量可审计；用户以 `lcu apps` 审计放行清单；文档明示该姿态 |
+| R8（新，已发生并修复） | 单例饿死：主页目录的空闲 relay 永久持锁，工作会话全部 standby | LCU 在真实会话不可用 | 生产复现后实现 D3.1 空闲 owner 让位（IPC `yield`：busy 拒绝 / 空闲让位并自降 standby），commit `db28afd`；待下次 OpenCode 重启生效 |
 
 ## 8. 里程碑估算
 

@@ -118,11 +118,40 @@ Result: the deployed `relay.mjs` started under that node and completed a real `j
 against the installed LCU, proving the deployed copy executes outside the repo tree and
 that the import rewrite is sound at runtime.
 
+### Production deployment and the idle-owner starvation (2026-11-04 evening)
+
+`install.mjs --yes` was run against the real `~/.config/opencode/opencode.json` and
+OpenCode was restarted, so the relay replaced the bare registration in production. The
+restart immediately reproduced the E4 starvation in the real app: OpenCode had spawned a
+relay for the home directory (the Start tab) and one for the working directory; the home
+relay won the startup race and kept the singleton lock while permanently idle, so every
+`js` call in the working session failed with the standby in-use error naming the owner
+pid. Killing the idle owner freed the lock and the working session's next `js` call took
+over (`relay_takeover` in the relay's diagnostic log, 89.9 s after its start) and ran
+real computer use.
+
+That incident produced the D3.1 idle-owner yield (see the relay commit "idle-owner
+yield"): a standby whose call is blocked requests a step-down over the token IPC, and an
+idle owner drains its open turns, closes its upstream, demotes itself to standby and
+frees the lock; a busy owner refuses with `busy`. The yield path was verified on-machine
+with two real relays on a disposable state directory (idle owner stepped down, the
+standby's call succeeded through a fresh upstream). In-app validation of the yield path
+is pending the next OpenCode restart, because relays keep their pre-yield code until
+then; until that restart, a working session can still be blocked by an idle owner from
+another directory (workaround: quit OpenCode and reopen, or kill the owner pid named in
+the in-use error).
+
+Known cosmetic quirk from the same deployment: OpenCode snapshots MCP tool descriptions
+when it connects, so a directory whose relay was a standby at startup keeps showing the
+standby tool description ("calls are refused…") even after its relay takes over; calls
+work regardless, and the full cua guide reaches the model in the first call's result.
+
 ### On-machine checks through the live relay (2026-11-04, post-implementation)
 
 Method: a stdio JSON-RPC probe drove `relay.mjs` against the installed LCU 0.13.5 with the
 user at the computer, plus the relay's own diagnostic log
-(`~/Library/Logs/LCU/opencode-*.jsonl`).
+(`~/Library/Logs/LCU/opencode-*.jsonl`). These checks ran through the live production
+relay after the deployment above.
 
 - `approval_auto_accepted` was logged for `com.apple.ActivityMonitor` with the tool
   metadata (`connector_id: computer-use`, `riskLevel`), and no tool arguments or results
@@ -153,7 +182,8 @@ Space, or closed window)", not as a permission or adapter failure.
 
 ### Test statistics (this tree, 2026-11-04)
 
-- `node --test adapters/opencode/test/`: 63 tests, 63 pass, 0 fail, 0 skipped.
+- `node --test adapters/opencode/test/`: 70 tests, 70 pass, 0 fail, 0 skipped (63 through
+  stage 3, plus 7 for the D3.1 idle-owner yield).
 - `npm test --prefix adapters` (the upstream adapter suite; its glob covers
   `adapters/test/*.test.mjs` only, so the OpenCode tests above are not part of this
   count): 262 tests — 254 pass, 0 fail, 8 skipped. No new failures introduced by the
