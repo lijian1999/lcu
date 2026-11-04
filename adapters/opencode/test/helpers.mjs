@@ -9,11 +9,19 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { JS_DESCRIPTION_PREFIX } from '../relay.mjs';
+import { FIXTURE_JS_DESCRIPTION, FIXTURE_JS_RESET_DESCRIPTION } from './fixture-descriptions.mjs';
 
 process.env.LCU_DIAGNOSTIC_LOG = '0';
 
 /** The fake upstream command the relay's `--lcu` points at in every test. */
 export const FIXTURE_PATH = fileURLToPath(new URL('./upstream-fixture.mjs', import.meta.url));
+
+export { FIXTURE_JS_DESCRIPTION, FIXTURE_JS_RESET_DESCRIPTION };
+
+/** What the relay's tools/list must serve for js: the Code Mode truncation-surviving prefix
+ * ahead of the fixture upstream's original description, which follows verbatim. */
+export const LISTED_JS_DESCRIPTION = JS_DESCRIPTION_PREFIX + FIXTURE_JS_DESCRIPTION;
 
 /** The fixed relay argv tests inject, so the fallback session name is deterministic. */
 export const RELAY_ARGV = ['node', 'relay.mjs', '--lcu', '/fixture/lcu'];

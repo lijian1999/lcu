@@ -9,6 +9,7 @@ import { appendFileSync } from 'node:fs';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { FIXTURE_JS_DESCRIPTION, FIXTURE_JS_RESET_DESCRIPTION } from './fixture-descriptions.mjs';
 
 const record = value => {
   if (process.env.LCU_OPENCODE_FIXTURE_LOG) {
@@ -18,13 +19,13 @@ const record = value => {
 
 const tools = [
   {
-    name: 'js', description: 'Fixture JS description.', inputSchema: {
+    name: 'js', description: FIXTURE_JS_DESCRIPTION, inputSchema: {
       type: 'object', properties: { code: { type: 'string' }, timeout_ms: { type: 'integer' } },
       required: ['code'], additionalProperties: false,
     },
   },
   {
-    name: 'js_reset', description: 'Fixture reset description.', inputSchema: {
+    name: 'js_reset', description: FIXTURE_JS_RESET_DESCRIPTION, inputSchema: {
       type: 'object', properties: {}, additionalProperties: false,
     },
   },

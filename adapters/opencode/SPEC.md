@@ -33,7 +33,8 @@
 ### 1.2 MCP 方法面（对 OpenCode，SDK Server + StdioServerTransport）
 
 - `initialize`：`capabilities: { tools: {} }`；`instructions`：**透传上游的 `client.instructions`**（OpenCode 会把它注入系统提示——模型学会 cua API 用法的关键，与 bare 注册对等）。owner：应答前等待 eager connect，上限 20s（OpenCode 的 MCP 启动预算 30s）；到点未连上或上游不可用 → instructions 置空，日志 `instructions_unavailable`，连接继续在后台进行。standby：经 IPC 向 owner 索取（见 1.6），结果缓存；owner 不在/超时 → ''。SDK 机制：`setRequestHandler(InitializeRequestSchema, …)` 覆盖内置 `_oninitialize`（文档明确"replace any previous handler"），应答 = `await server._oninitialize(request)` 的结果按需附加 `instructions` 字段（应答形状 `{protocolVersion, capabilities, serverInfo, instructions?}`，instructions 为空时不携带）。
-- `tools/list`：owner → 首次调用触发上游连接（`createCuaClient(...).connect()`，超时 `CONNECT_TIMEOUT_MS`），成功后透传 `publicTools()`（恰好 js/js_reset，含原始 description——CUA 指南在里面，**不得改写**）；上游连接失败 → 返回空 tools 列表 + 日志（不崩，下次调用重试连接）。standby → 经 IPC 向 owner 索取其 `publicTools()` 并缓存（owner 未连上/不在 → 回退静态最小描述符，见 1.5，下次 list 重试）。
+- `tools/list`：owner → 首次调用触发上游连接（`createCuaClient(...).connect()`，超时 `CONNECT_TIMEOUT_MS`），成功后透传 `publicTools()`（恰好 js/js_reset，含原始 description——CUA 指南在里面，原文**不得改写**；js 描述另加截断对策前缀，见下条）；上游连接失败 → 返回空 tools 列表 + 日志（不崩，下次调用重试连接）。standby → 经 IPC 向 owner 索取其 `publicTools()` 并缓存（owner 未连上/不在 → 回退静态最小描述符，见 1.5，下次 list 重试）。
+- **js 描述前缀（Code Mode 截断对策，生产证据：ses_e59f0c6a4ffe / ses_e5a1b7bedffe，2026-11-04）**：relay 暴露的每个 js 描述符都在 description **最前面**拼上导出常量 `JS_DESCRIPTION_PREFIX`（111 字符 + 空行：`Computer use. First call: \`await cua.getState()\` returns the guide. Output: nodeRepl.write(). No browser APIs.`），上游原文逐字保留在前缀之后；已以前缀开头的描述不再叠加（每次 list 都是全新拼接，绝不改写上游原对象）；`js_reset` 不加。三个应用点：owner 的 `publicTools()` 透传（list 时映射）；standby 经 IPC 继承的列表（standby 侧映射——owner 的 IPC `tools` 应答是原始 `publicTools()`）；静态 `STANDBY_TOOLS`（前缀直接并入 js description 定义）。为什么：OpenCode 的 Code Mode 把工具描述截断到 ~110-120 字符（只剩首句），上游 1511 字符描述中的三条使用规则（首次调用须执行恰好一个文档化 API 调用如 `await cua.getState()` 以取回完整指南；输出用 `nodeRepl.write()`，裸尾表达式只会得到 null；Browser APIs 禁用，乱试原始 `computer.*` 会撞审批参数形状错误）模型全看不到——生产会话 ses_e59f0c6a4ffe / ses_e5a1b7bedffe 里模型反复这样浪费回合，直到自己从函数源码反推出用法；前缀恰好落在截断窗内，截断后模型仍能看到三条规则。
 - `tools/call`：仅接受 `js`/`js_reset`，其余 → SDK 错误 `InvalidParams`/未知工具错误。处理流程见 1.3/1.7。
 - `resources/*`、`prompts/*` 等一律不支持（不声明 capability）。
 - **永不**向下发送 `elicitation/create`、`sampling` 等请求（v0.4：无审批呈现）。
@@ -64,7 +65,7 @@ const client = createCuaClient({
 
 ### 1.5 静态 standby 描述符
 
-`js`：`{ name: 'js', description: 'Run JavaScript with the cua_repl computer-use API (LCU relay standby: calls are refused while another OpenCode session owns the runtime).', inputSchema: { type: 'object', properties: { code: { type: 'string' }, timeout_ms: { type: 'integer' } }, required: ['code'] } }`；`js_reset` 同理（inputSchema `{type:'object'}`）。字面描述无需精确——standby 下模型应读到 isError 的人话提示。
+`js`：`{ name: 'js', description: 'Run JavaScript with the cua_repl computer-use API (LCU relay standby: calls are refused while another OpenCode session owns the runtime).', inputSchema: { type: 'object', properties: { code: { type: 'string' }, timeout_ms: { type: 'integer' } }, required: ['code'] } }`；`js_reset` 同理（inputSchema `{type:'object'}`）。字面描述无需精确——standby 下模型应读到 isError 的人话提示。现版 js description 前面另带 §1.2 的 Code Mode 截断前缀。
 
 ### 1.6 IPC（插件 ↔ owner 中继）
 

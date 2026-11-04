@@ -8,11 +8,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createRelay } from '../relay.mjs';
+import { createRelay, JS_DESCRIPTION_PREFIX } from '../relay.mjs';
 import { ipcRequest } from '../ipc.mjs';
 import { prepareStateDirectory, readToken } from '../singleton.mjs';
 import {
-  captureLog, connectHost, FIXTURE_PATH, makeTempDirectory, readFixtureLog, RELAY_ARGV,
+  captureLog, connectHost, FIXTURE_PATH, LISTED_JS_DESCRIPTION, makeTempDirectory, readFixtureLog, RELAY_ARGV,
   removeTempDirectory, sessionMeta, waitFor, withEnv,
 } from './helpers.mjs';
 
@@ -53,7 +53,7 @@ test('an owner initialize answer forwards the upstream instructions (eager conne
         assert.equal(host.client.getInstructions() ?? '', GUIDE);
         const listed = await host.client.listTools();
         assert.deepEqual(listed.tools.map(tool => tool.name), ['js', 'js_reset']);
-        assert.equal(listed.tools[0].description, 'Fixture JS description.');
+        assert.equal(listed.tools[0].description, LISTED_JS_DESCRIPTION);
         assert.ok(log.events.some(event => event.event === 'upstream_connect' && event.ok === true),
           'the owner connected its upstream eagerly, before any model call');
       } finally {
@@ -144,13 +144,13 @@ test('a standby initialize and tools/list inherit the owner\'s instructions and 
           'the standby forwards the owner\'s instructions at initialize');
         const listed = await host.client.listTools();
         assert.deepEqual(listed.tools.map(tool => tool.name), ['js', 'js_reset']);
-        assert.equal(listed.tools[0].description, 'Fixture JS description.', 'not the standby descriptors');
+        assert.equal(listed.tools[0].description, LISTED_JS_DESCRIPTION, 'not the standby descriptors');
         // The standby never started an upstream of its own: exactly one fixture process exists.
         assert.equal(readFixtureLog(logPath).filter(entry => entry.type === 'fixture-start').length, 1);
         // The answer is cached: with the owner's channel gone, a re-list still serves it.
         rmSync(owner.tokenPath, { force: true });
         const again = await host.client.listTools();
-        assert.equal(again.tools[0].description, 'Fixture JS description.');
+        assert.equal(again.tools[0].description, LISTED_JS_DESCRIPTION);
       } finally {
         await host.close();
         await owner.dispose('test end');
@@ -174,6 +174,10 @@ test('a standby with no owner degrades to empty instructions and the static desc
       const started = Date.now();
       assert.equal(host.client.getInstructions() ?? '', '');
       const listed = await host.client.listTools();
+      // Even the static fallback js descriptor carries the truncation prefix (it is baked
+      // into STANDBY_TOOLS), and the standby suffix still explains the refusal.
+      assert.ok(listed.tools[0].description.startsWith(JS_DESCRIPTION_PREFIX),
+        'the static fallback js descriptor carries the truncation prefix');
       assert.match(listed.tools[0].description, /standby/);
       assert.ok(Date.now() - started < 5_000, 'the degrade is immediate, not a hang');
       assert.ok(standbyLog.events.some(event => event.event === 'instructions_unavailable'),
@@ -260,7 +264,7 @@ test('an instructions request that lands on a yielding owner is retried against 
           assert.equal(host.client.getInstructions() ?? '', GUIDE,
             'the retried ask re-read the token and reached the new owner');
           const listed = await host.client.listTools();
-          assert.equal(listed.tools[0].description, 'Fixture JS description.',
+          assert.equal(listed.tools[0].description, LISTED_JS_DESCRIPTION,
             'the tools ask reached the new owner too');
         } finally {
           await host.close();

@@ -60,11 +60,28 @@ const SERVER_INFO = { name: 'lcu-opencode-relay', version: '0.1.0' };
 const SESSION_ID_META = 'ai.opencode/sessionID';
 const STANDBY_SUFFIX = ' (LCU relay standby: calls are refused while another OpenCode session owns the runtime).';
 
+/**
+ * Prepended to the js tool description the relay exposes, ahead of the upstream's original
+ * text. OpenCode's Code Mode truncates tool descriptions to roughly the first 110-120
+ * characters — just the upstream guide's opening sentence — so the usage rules the model
+ * needs never reach it: the first invocation must execute exactly one documented API call
+ * (such as `await cua.getState()`) whose result carries the full guide, output goes through
+ * `nodeRepl.write()` (a bare tail expression returns null), and browser APIs are disabled
+ * (raw `computer.*` calls hit approval-parameter errors instead). Production sessions
+ * ses_e59f0c6a4ffe / ses_e5a1b7bedffe (2026-11-04) wasted turns in exactly those three ways
+ * until the model reverse-engineered the API from function sources. This prefix fits the
+ * truncation window, so the rules survive it; it is additive — the upstream's description
+ * follows verbatim, a description that already opens with it is left alone, and js_reset
+ * never gets it.
+ */
+export const JS_DESCRIPTION_PREFIX =
+  'Computer use. First call: `await cua.getState()` returns the guide. Output: nodeRepl.write(). No browser APIs.\n\n';
+
 /** The static tool list a standby relay shows; the descriptions tell the model why calls fail. */
 export const STANDBY_TOOLS = [
   {
     name: 'js',
-    description: `Run JavaScript with the cua_repl computer-use API${STANDBY_SUFFIX}`,
+    description: `${JS_DESCRIPTION_PREFIX}Run JavaScript with the cua_repl computer-use API${STANDBY_SUFFIX}`,
     inputSchema: {
       type: 'object',
       properties: { code: { type: 'string' }, timeout_ms: { type: 'integer' } },
@@ -77,6 +94,18 @@ export const STANDBY_TOOLS = [
     inputSchema: { type: 'object' },
   },
 ];
+
+/**
+ * The js descriptor with the truncation-surviving prefix; every other descriptor passes
+ * through untouched, and an already-prefixed description is left alone — the owner applies
+ * this per list to fresh copies (publicTools() keeps returning the upstream's original
+ * objects, which must never be rewritten), so repeated lists cannot stack the prefix.
+ */
+function withJsDescriptionPrefix(tool) {
+  if (tool?.name !== 'js' || typeof tool.description !== 'string' ||
+    tool.description.startsWith(JS_DESCRIPTION_PREFIX)) return tool;
+  return { ...tool, description: JS_DESCRIPTION_PREFIX + tool.description };
+}
 
 /** `node relay.mjs [--lcu <path>] [--state-dir <dir>]` — unknown arguments are refused. */
 export function parseRelayArgs(argv = []) {
@@ -587,11 +616,13 @@ export async function createRelay({
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     if (role === 'standby') {
       const ownerTools = await standbyToolList();
-      return { tools: ownerTools ?? STANDBY_TOOLS };
+      // Inherited descriptors get the prefix here (the owner's IPC tools answer is the raw
+      // publicTools()); the static fallback carries it in its own definition.
+      return { tools: ownerTools === undefined ? STANDBY_TOOLS : ownerTools.map(withJsDescriptionPrefix) };
     }
     try {
       await ensureUpstream();
-      return { tools: upstream.publicTools() };
+      return { tools: upstream.publicTools().map(withJsDescriptionPrefix) };
     } catch {
       // Stay serveable: the next call retries the connection.
       return { tools: [] };

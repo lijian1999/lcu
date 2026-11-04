@@ -14,7 +14,7 @@ import { createRelay } from '../relay.mjs';
 import { ipcRequest } from '../ipc.mjs';
 import { prepareStateDirectory, readLockOwner, readToken, writeToken } from '../singleton.mjs';
 import {
-  captureLog, connectHost, entrySession, FIXTURE_PATH, makeTempDirectory, readFixtureLog,
+  captureLog, connectHost, entrySession, FIXTURE_PATH, LISTED_JS_DESCRIPTION, makeTempDirectory, readFixtureLog,
   RELAY_ARGV, removeTempDirectory, sessionMeta, waitFor, waitForEntry, withEnv,
 } from './helpers.mjs';
 
@@ -214,7 +214,7 @@ test('after a yield the lock, token, and socket belong to the new owner', async 
           { ok: true, pid: STANDBY_PID, role: 'owner' });
         assert.notEqual(readToken(pair.standby.tokenPath), undefined, 'a fresh token file exists');
         const listed = await pair.ownerHost.client.listTools();
-        assert.equal(listed.tools[0].description, 'Fixture JS description.',
+        assert.equal(listed.tools[0].description, LISTED_JS_DESCRIPTION,
           'the stepped-down relay inherits the new owner\'s descriptors');
       } finally {
         await closePair(pair);

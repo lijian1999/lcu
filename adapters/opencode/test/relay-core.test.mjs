@@ -6,12 +6,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { createSessions } from '../sessions.mjs';
-import { createRelay, createApprovalPolicy, fallbackIdentity, parseRelayArgs } from '../relay.mjs';
+import { createRelay, createApprovalPolicy, fallbackIdentity, JS_DESCRIPTION_PREFIX, parseRelayArgs } from '../relay.mjs';
 import { readToken } from '../singleton.mjs';
 import { ipcRequest } from '../ipc.mjs';
 import {
-  captureLog, connectHost, entrySession, FIXTURE_PATH, makeTempDirectory, readFixtureLog,
-  RELAY_ARGV, removeTempDirectory, sessionMeta, UUID_PATTERN, waitFor, waitForEntry, withEnv,
+  captureLog, connectHost, entrySession, FIXTURE_JS_RESET_DESCRIPTION, FIXTURE_PATH, LISTED_JS_DESCRIPTION,
+  makeTempDirectory, readFixtureLog, RELAY_ARGV, removeTempDirectory, sessionMeta, UUID_PATTERN, waitFor, waitForEntry, withEnv,
 } from './helpers.mjs';
 
 test('relay arguments parse, and the fallback identity is a stable per-connection name', () => {
@@ -28,7 +28,7 @@ test('relay arguments parse, and the fallback identity is a stable per-connectio
   assert.notEqual(fallbackIdentity(['node', 'relay.mjs', '--lcu', '/other']), identity);
 });
 
-test('initialize forwards the upstream instructions, and tools/list the original descriptors', async () => {
+test('initialize forwards the upstream instructions, and tools/list the prefixed original descriptors', async () => {
   const directory = makeTempDirectory('lcu-opencode-list-');
   const logPath = join(directory, 'fixture.jsonl');
   try {
@@ -41,9 +41,42 @@ test('initialize forwards the upstream instructions, and tools/list the original
           'the owner initialize answer waits for the eager connect and forwards the guide');
         const listed = await host.client.listTools();
         assert.deepEqual(listed.tools.map(tool => tool.name), ['js', 'js_reset']);
-        assert.equal(listed.tools[0].description, 'Fixture JS description.');
+        assert.equal(listed.tools[0].description, LISTED_JS_DESCRIPTION);
         assert.deepEqual(listed.tools[0].inputSchema.required, ['code']);
         assert.deepEqual(log.events[0], { event: 'relay_start', role: 'owner', pid: process.pid, lcu: FIXTURE_PATH });
+      } finally {
+        await host.close();
+        await relay.dispose('test end');
+      }
+    });
+  } finally { removeTempDirectory(directory); }
+});
+
+test('the js description opens with the truncation prefix, exactly once, and js_reset stays unprefixed', async () => {
+  const directory = makeTempDirectory('lcu-opencode-prefix-');
+  const logPath = join(directory, 'fixture.jsonl');
+  try {
+    await withEnv('LCU_OPENCODE_FIXTURE_LOG', logPath, async () => {
+      const relay = await createRelay({ lcuPath: FIXTURE_PATH, stateDir: directory, log: captureLog(), argv: RELAY_ARGV });
+      const host = await connectHost(relay);
+      try {
+        const listed = await host.client.listTools();
+        const js = listed.tools.find(tool => tool.name === 'js');
+        const reset = listed.tools.find(tool => tool.name === 'js_reset');
+        // "Prefix + original": the prefix opens the description and the upstream's own text —
+        // its first sentence included — follows it verbatim.
+        assert.ok(js.description.startsWith(JS_DESCRIPTION_PREFIX), 'the prefix opens the description');
+        assert.ok(js.description.includes('Control native apps or browsers'), 'the upstream original follows the prefix');
+        assert.equal(js.description, LISTED_JS_DESCRIPTION);
+        // OpenCode's Code Mode keeps only ~110-120 characters of a description: the prefix
+        // alone must fit that window, or the rules it carries are lost again.
+        assert.ok(JS_DESCRIPTION_PREFIX.length <= 120, 'the prefix fits the Code Mode truncation window');
+        // A second list serves the same composition — never a stacked second prefix.
+        const again = await host.client.listTools();
+        assert.equal(again.tools.find(tool => tool.name === 'js').description, LISTED_JS_DESCRIPTION);
+        // js_reset passes through untouched.
+        assert.ok(!reset.description.startsWith(JS_DESCRIPTION_PREFIX), 'js_reset carries no prefix');
+        assert.equal(reset.description, FIXTURE_JS_RESET_DESCRIPTION);
       } finally {
         await host.close();
         await relay.dispose('test end');

@@ -11,7 +11,7 @@ import { acquireLock, prepareStateDirectory, readLockOwner, readToken, writeToke
 import { createRelay } from '../relay.mjs';
 import { ipcRequest } from '../ipc.mjs';
 import {
-  captureLog, connectHost, FIXTURE_PATH, makeTempDirectory, readFixtureLog, RELAY_ARGV,
+  captureLog, connectHost, FIXTURE_PATH, LISTED_JS_DESCRIPTION, makeTempDirectory, readFixtureLog, RELAY_ARGV,
   removeTempDirectory, sessionMeta, waitFor, withEnv,
 } from './helpers.mjs';
 
@@ -79,10 +79,11 @@ test('a second relay beside the owner inherits its descriptors and refuses its c
         assert.deepEqual(ownerLog.events[0], { event: 'relay_start', role: 'owner', pid: process.pid, lcu: FIXTURE_PATH });
         assert.deepEqual(standbyLog.events[0], { event: 'relay_start', role: 'standby', pid: process.pid, lcu: FIXTURE_PATH });
         // The standby asks the owner over IPC: the model sees the real descriptors (and the
-        // initialize answer carried the owner's instructions), not the static fallback list.
+        // initialize answer carried the owner's instructions), not the static fallback list —
+        // with the truncation prefix the relay adds to the js description.
         const listed = await host.client.listTools();
         assert.deepEqual(listed.tools.map(tool => tool.name), ['js', 'js_reset']);
-        assert.equal(listed.tools[0].description, 'Fixture JS description.');
+        assert.equal(listed.tools[0].description, LISTED_JS_DESCRIPTION);
         // D3.1: an idle owner would yield to this caller, so the refusal scenario here is an
         // owner with no yield channel (its token file is gone): the takeover falls back to
         // the plain in-use error.
