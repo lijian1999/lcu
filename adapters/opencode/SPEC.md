@@ -24,9 +24,9 @@
 1. `--lcu` 路径必须存在且可执行（`fs.accessSync` X_OK），否则 stderr 打印并 exit 2。
 2. 尝试成为 **owner**：在 state-dir 下创建 `relay.lock`（`open(path, 'wx')` 写入 `{pid, startedAt}` JSON；`EEXIST` 时读出 pid，若该 pid 已死（`kill(pid, 0)` ESRCH）则删除陈旧锁重试一次，仍失败 → 进入 **standby** 模式）。
 3. **owner**：创建 `relay.token`（0600，32 字节随机 hex）与 `relay.sock`（Unix socket，先 unlink 旧文件）。启动诊断日志 `openDiagnosticLog({ adapter: 'opencode' })`。惰性连接上游（见 1.4）。打开 IPC 服务（见 1.6）。
-4. **standby**：不连上游、不开 IPC。照常响应 `initialize`/`tools/list`（静态 js/js_reset 描述符，见 1.5）；`tools/call` 时先尝试接管（重试 step 2 的锁获取；成功则原地升级为 owner：建 token/sock/日志、连上游，然后继续处理本次调用），失败则返回 isError 文本：
+4. **standby**：不连上游、不开 IPC。照常响应 `initialize`/`tools/list`（静态 js/js_reset 描述符，见 1.5）；`tools/call` 时先尝试接管（重试 step 2 的锁获取；若锁被**活着的** owner 持有，先向其 sock 发 `{token, type:'yield'}`（token 从 `<state-dir>/relay.token` 读；无 sock/token → 直接 in-use 错误）：owner 回 `{ok:false, error:'busy'}` → 保持 standby，in-use 错误；owner 回 `{ok:true}`（或 `not_owner`）或无响应/超时（1s）→ 重试 acquire（最多 3 次、间隔 ~100ms；O_EXCL 天然仲裁并发 standby；锁在但进程死的清除沿用 step 2），成功则原地升级为 owner：建 token/sock/日志、连上游，然后继续处理本次调用），失败则返回 isError 文本：
    `LCU is in use by another OpenCode session (owner pid <N>). Switch to that OpenCode window or close it, then retry here.`
-5. 诊断事件：`relay_start {role: 'owner'|'standby', pid, lcu}`；standby 接管成功记 `relay_takeover {waitedMs}`。
+5. 诊断事件：`relay_start {role: 'owner'|'standby', pid, lcu}`；standby 接管成功记 `relay_takeover {waitedMs}`；owner 让位记 `relay_yield {openTurns}`。
 
 进程退出（SIGTERM/SIGINT/stdin EOF/beforeExit）：对每个有开放 turn 的 session 发 `Interrupt`（单个 2s 排空预算，Promise.race），关上游 client，删 sock/token/lock，日志 `relay_stop {reason}`。
 
@@ -73,6 +73,7 @@ const client = createCuaClient({
   - `{token, type:'bind', sessionID}` → `{ok:true, pid}`；语义：该 session 新一轮 prompt 开始——若该 session 已有 open turn：in-flight > 0 → `client.turnEnded({sessionId, turnId, event:'Interrupt'})`，否则 `'Stop'`；随后把该 session 的 turn 标记为已结束（下一个 js 来时新建 turn）。重复 bind（无 open turn）→ no-op `{ok:true}`。
   - `{token, type:'turn_ended', sessionID, event}`（event ∈ Stop|Interrupt，默认 Stop）→ 结束该 session 的 open turn（同上选择逻辑：in-flight > 0 或 event='Interrupt' → Interrupt）。
   - `{token, type:'ping'}` → `{ok:true, pid, role:'owner'}`（插件用于发现 owner）。
+  - `{token, type:'yield'}`（D3.1，standby 调用时的接管尝试触发——relay 绝不主动发，防乒乓）→ owner 判定：任一 session 的 in-flight 调用存在（或自身正在升级/正在让位）→ `{ok:false, error:'busy'}`（不释放）；否则执行**让位序列**：① 对所有 open turn 发 `Interrupt`（复用退出排空逻辑，2s 预算，失败不阻塞）；② 清空 open turn 簿记并关闭上游 client（`upstream?.close()`，upstreamReady=false）；③ 关闭自己的 IPC server（**不要**删除 sock 文件——新 owner 自行 unlink 重建；`ipc.close` 默认强断连接，让位路径须用优雅关闭让 `{ok:true}` 先送达）；④ 删除 `relay.token`，并仅当 `lockOwnedBy(stateDir, pid)` 时删除 `relay.lock`；⑤ `role='standby'`，日志 `relay_yield {openTurns}`；⑥ 回 `{ok:true}`。让位后 relay 继续存活、继续以 standby 服务它自己的 OpenCode 连接（下一次调用走接管路径）。已不是 owner（重复 yield / 正在让位）→ `{ok:false, error:'not_owner'}`。
   - 未知 type / 坏 JSON → `{ok:false, error:'bad_request'}` 并断开。
 - **失败重试语义**：`client.turnEnded` 抛 `LCU_TURN_CLEANUP_TIMEOUT` → 视为已受理（后台继续清理），open turn 照常结束，日志 `turn_end {outcome:'cleanup_timeout'}`；其他错误 → 该 session 记 `pendingEnd = {turnId, event}`，该 session 下一次 `js` 调用前先重试 turnEnded（成功才继续 js；仍失败 → isError `LCU is still finishing the previous turn`）。上游未连接时 turnEnded 直接忽略（client.mjs 行为）。
 - 插件侧不必等在本仓库实现（阶段 2），但 relay 侧先按此协议实现并单测。
@@ -143,7 +144,7 @@ async function approvalPolicy(params, { log }) {
   5. bind 后再次 bind → 上游收到 `turn_ended {Stop}`（fixture 断言 turn_ended 调用参数）；
   6. in-flight 时 bind → `Interrupt`；
   7. 审批策略：fixture 发 elicitation/create → relay 自动 accept（fixture 断言收到 accept），诊断日志出现 `approval_auto_accepted` 且含 app/risk；guard 命中场景（fixture 伪造 `_meta.connector_id='computer-use', tool_params.app='com.apple.Terminal'`）→ decline（client.mjs 行为）；
-  8. 单例：同 state-dir 起第二个 relay → standby；其 js 返回 in-use 文本；owner 锁文件删除（模拟崩溃）后 standby 下一次调用成功接管；
+  8. 单例：同 state-dir 起第二个 relay → standby；其 js 返回 in-use 文本；owner 锁文件删除（模拟崩溃）后 standby 下一次调用成功接管；D3.1 yield——空闲 owner 让位（open turn 被 `Interrupt`，锁/token/sock 归新 owner，旧 owner 的 MCP 连接以 standby 继续服务）、in-flight 时 owner 回 `busy`（in-use 文本不变）、对 standby 发 yield 得 `not_owner`、错误 token 被断开（in-use）、无响应 owner 保持锁直至其进程死亡后陈旧锁被清除。
   9. IPC：错误 token 被断开；bind/turn_ended/ping 各分支；`LCU_TURN_CLEANUP_TIMEOUT` 视为受理；
   10. 退出排空：SIGTERM → fixture 收到所有 open turn 的 Interrupt。
 - 阶段 2 增测：事件映射表（假事件流 → 断言 IPC 消息）；节流告警。

@@ -81,11 +81,16 @@ test('a second relay beside the owner serves standby descriptors and refuses its
         const listed = await host.client.listTools();
         assert.deepEqual(listed.tools.map(tool => tool.name), ['js', 'js_reset']);
         assert.match(listed.tools[0].description, /standby/);
+        // D3.1: an idle owner would yield to this caller, so the refusal scenario here is an
+        // owner with no yield channel (its token file is gone): the takeover falls back to
+        // the plain in-use error.
+        rmSync(owner.tokenPath, { force: true });
         assert.equal((await host.client.callTool({ name: 'js', arguments: { code: 'x' }, _meta: sessionMeta('standby-session') })).isError, true);
         const refused = await host.client.callTool({ name: 'js', arguments: { code: 'x' }, _meta: sessionMeta('standby-session') });
         assert.match(refused.content[0].text,
           new RegExp(`^LCU is in use by another OpenCode session \\(owner pid ${process.pid}\\)\\. ` +
             'Switch to that OpenCode window or close it, then retry here\\.$'));
+        assert.equal(standby.role, 'standby', 'the takeover was refused');
         assert.equal(readFixtureLog(logPath).length, 0, 'a standby refusal never reaches the upstream');
       } finally {
         await host.close();

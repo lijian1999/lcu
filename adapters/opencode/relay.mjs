@@ -6,26 +6,35 @@
 // except when the host guard in the client refuses an agent-hosting app), and ends turns when
 // the OpenCode lifecycle plugin reports bind/turn_ended over a private token-gated Unix socket.
 // It is a per-state-directory singleton: the first relay wins and owns the socket, later ones
-// serve static standby descriptors and try to take the lock over on each call. This file does
-// not install anything, does not run `lcu setup`, and never writes tool arguments or results
-// to the diagnostic log.
+// serve static standby descriptors and try to take the lock over on each call. A standby whose
+// lock attempt finds a live owner asks that owner to yield (D3.1): an idle owner ends its open
+// turns, closes its upstream and IPC surface, and steps down to standby so the caller can take
+// over — an owner with a call in flight refuses with `busy` and keeps the runtime.
+// This file does not install anything, does not run `lcu setup`, and never writes tool
+// arguments or results to the diagnostic log.
 import { createHash, randomUUID as defaultRandomUUID } from 'node:crypto';
-import { accessSync, constants, rmSync } from 'node:fs';
+import { accessSync, constants, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { createCuaClient, isMainModule, MODEL_TOOLS, TURN_CLEANUP_TIMEOUT_CODE } from '../client.mjs';
 import { openDiagnosticLog } from '../diagnostics.mjs';
-import { startIpcServer } from './ipc.mjs';
+import { ipcRequest, startIpcServer } from './ipc.mjs';
 import { createSessions } from './sessions.mjs';
 import {
   acquireLock, defaultLcuPath, defaultStateDirectory, lockOwnedBy, LOCK_NAME, pidAlive,
-  prepareStateDirectory, SOCKET_NAME, TOKEN_NAME, writeToken,
+  prepareStateDirectory, readToken, SOCKET_NAME, TOKEN_NAME, writeToken,
 } from './singleton.mjs';
 
 /** Every session's open turn gets this long, together, to end upstream before the relay exits. */
 export const DRAIN_BUDGET_MS = 2_000;
+
+/** A standby waits this long for the owner's yield reply before treating it as unreachable. */
+export const YIELD_TIMEOUT_MS = 1_000;
+/** Lock attempts after a yield reply, spaced out; O_EXCL arbitrates concurrent standbys. */
+export const TAKEOVER_ATTEMPTS = 3;
+export const TAKEOVER_RETRY_DELAY_MS = 100;
 
 const SERVER_INFO = { name: 'lcu-opencode-relay', version: '0.1.0' };
 const SESSION_ID_META = 'ai.opencode/sessionID';
@@ -81,6 +90,7 @@ export function fallbackIdentity(argv = process.argv) {
 
 const asText = error => (error instanceof Error ? error.message : String(error));
 const errorResult = text => ({ isError: true, content: [{ type: 'text', text }] });
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /** The v0.4 approval policy: accept every elicitation the client's guard let through, log the metadata. */
 export function createApprovalPolicy(log) {
@@ -132,22 +142,35 @@ export async function createRelay({
   let ownerPid = election.acquired ? pid : election.pid;
   log.event('relay_start', { role, pid, lcu: lcuPath });
 
-  // The upstream LCU client, connected lazily on the first tools/list or tools/call.
+  // The upstream LCU client, connected lazily on the first tools/list or tools/call. The
+  // epoch invalidates a connect that is still running when the owner yields (or disposes):
+  // the loser re-checks and stands down instead of marking a closed client ready.
   let upstream;
   let upstreamReady = false;
   let connecting;
+  let upstreamEpoch = 0;
   // Owner-only services: the lifecycle IPC server.
   let ipc;
+  // Set while a standby is upgrading to owner, and while an owner is stepping down: a
+  // foreign yield must not free a lock whose owner still owes its caller a turn, and a
+  // standby waits out a step-down before contending for the lock.
+  let upgrading = false;
+  let yielding;
 
   const approvalPolicy = createApprovalPolicy(log);
 
   function ensureUpstream() {
     if (upstreamReady) return upstream;
     if (!connecting) {
+      const epoch = upstreamEpoch;
       connecting = (async () => {
         try {
           upstream ??= createCuaClient({ command: [lcuPath], adapter: 'opencode', log, onElicitation: approvalPolicy });
           await upstream.connect();
+          if (epoch !== upstreamEpoch) {
+            await upstream.close().catch(() => {});
+            throw new Error('the relay stepped down while connecting');
+          }
           upstreamReady = true;
           return upstream;
         } catch {
@@ -218,6 +241,47 @@ export async function createRelay({
     }
   }
 
+  /**
+   * IPC `yield`: a standby that is trying to take over asks this owner to step down. The
+   * owner refuses with `busy` while any call is in flight — or while its own takeover is
+   * still upgrading, or while a step-down is already running. Otherwise it ends every open
+   * turn with Interrupts (2 s budget; failures do not block the step-down), closes the
+   * upstream client and its IPC server — leaving the socket file for the next owner to
+   * unlink — and removes its token and lock. The relay stays alive as a standby serving its
+   * own OpenCode connection; its next call goes through the ordinary takeover path.
+   */
+  async function onYield() {
+    if (role !== 'owner') return { ok: false, error: 'not_owner' };
+    if (upgrading || yielding || sessions.hasInFlight()) return { ok: false, error: 'busy' };
+    const openTurns = sessions.openTurns();
+    try {
+      await drainOpenTurns();
+    } catch { /* each turn end reports its own outcome; a failure does not block the yield */ }
+    if (upgrading || sessions.hasInFlight()) return { ok: false, error: 'busy' };
+    yielding = (async () => {
+      role = 'standby';
+      // The upstream client is going away, so no open turn can survive it: a fresh
+      // connection after a re-takeover must start from fresh turns.
+      sessions.clearAllTurns();
+      upstreamEpoch += 1;
+      await upstream?.close().catch(() => {});
+      upstream = undefined;
+      upstreamReady = false;
+      // A graceful close: the step-down reply to the waiting standby is still delivered.
+      void ipc?.close({ force: false }).catch(() => {});
+      ipc = undefined;
+      rmSync(join(stateDir, TOKEN_NAME), { force: true });
+      if (lockOwnedBy(stateDir, pid)) rmSync(join(stateDir, LOCK_NAME), { force: true });
+      log.event('relay_yield', { openTurns: openTurns.length });
+    })();
+    try {
+      await yielding;
+    } finally {
+      yielding = undefined;
+    }
+    return { ok: true };
+  }
+
   const handleIpcMessage = async message => {
     switch (message.type) {
       case 'ping': return { ok: true, pid, role: 'owner' };
@@ -228,6 +292,8 @@ export async function createRelay({
         if (typeof message.sessionID !== 'string' || !message.sessionID) break;
         if (message.event !== undefined && message.event !== 'Stop' && message.event !== 'Interrupt') break;
         return onTurnEnded(message.sessionID, message.event);
+      case 'yield':
+        return onYield();
     }
     return { ok: false, error: 'bad_request' };
   };
@@ -243,17 +309,59 @@ export async function createRelay({
 
   if (role === 'owner') await startOwnerServices();
 
+  /**
+   * Ask the current owner (per the token and socket files) to step down so this relay can
+   * retry the lock. Returns 'freed' when the owner yielded (or has already stepped down),
+   * 'busy' when it refused with work in flight, 'unreachable' when nothing answered — the
+   * lock may then be stale, which the lock retries clear — and 'no_channel' when there is
+   * no token file or socket file to ask through.
+   */
+  async function requestOwnerYield() {
+    const token = readToken(join(stateDir, TOKEN_NAME));
+    if (token === undefined || !existsSync(socketPath)) return 'no_channel';
+    try {
+      const response = await ipcRequest(socketPath, { token, type: 'yield' }, { timeoutMs: YIELD_TIMEOUT_MS });
+      if (response.ok || response.error === 'not_owner') return 'freed';
+      return 'busy';
+    } catch {
+      return 'unreachable';
+    }
+  }
+
+  /** Retry the lock a few times, spaced out; O_EXCL arbitrates against concurrent standbys. */
+  async function retryAcquire() {
+    let election = acquireLock(stateDir, { pid, alive });
+    for (let attempt = 1; !election.acquired && attempt < TAKEOVER_ATTEMPTS; attempt += 1) {
+      await delay(TAKEOVER_RETRY_DELAY_MS);
+      election = acquireLock(stateDir, { pid, alive });
+    }
+    return election;
+  }
+
   /** A standby relay tries the lock again per call and, when it wins, upgrades in place. */
   async function takeOver() {
     if (role === 'owner') return true;
-    const election = acquireLock(stateDir, { pid, alive });
+    // An owner that is stepping down frees the lock a moment later; wait that out first.
+    if (yielding) await yielding.catch(() => {});
+    let election = acquireLock(stateDir, { pid, alive });
     if (!election.acquired) {
       ownerPid = election.pid;
-      return false;
+      const outcome = await requestOwnerYield();
+      if (outcome === 'busy' || outcome === 'no_channel') return false;
+      election = await retryAcquire();
+      if (!election.acquired) {
+        ownerPid = election.pid;
+        return false;
+      }
     }
-    role = 'owner';
-    log.event('relay_takeover', { waitedMs: Date.now() - startedAt });
-    await startOwnerServices();
+    upgrading = true;
+    try {
+      role = 'owner';
+      log.event('relay_takeover', { waitedMs: Date.now() - startedAt });
+      await startOwnerServices();
+    } finally {
+      upgrading = false;
+    }
     return true;
   }
 
@@ -360,9 +468,12 @@ export async function createRelay({
       } catch { /* each turn end reports its own outcome */ }
       await upstream?.close().catch(() => {});
       await ipc?.close().catch(() => {});
-      rmSync(socketPath, { force: true });
-      rmSync(join(stateDir, TOKEN_NAME), { force: true });
-      if (role === 'owner' && lockOwnedBy(stateDir, pid)) {
+      // Only the relay the lock still names removes the shared files. A standby — including
+      // one that yielded to another relay — would otherwise delete the current owner's
+      // socket and token as it exits.
+      if (lockOwnedBy(stateDir, pid)) {
+        rmSync(socketPath, { force: true });
+        rmSync(join(stateDir, TOKEN_NAME), { force: true });
         rmSync(join(stateDir, LOCK_NAME), { force: true });
       }
       log.event('relay_stop', { reason });
@@ -378,6 +489,9 @@ export async function createRelay({
     get socketPath() { return role === 'owner' ? socketPath : undefined; },
     get tokenPath() { return join(stateDir, TOKEN_NAME); },
     get lockPath() { return join(stateDir, LOCK_NAME); },
+    // The token-gated IPC surface of the owner role, exposed for tests (a standby does not
+    // listen on the socket, so the not_owner reply is only reachable through this seam).
+    handleIpcMessage,
     dispose,
   };
 }

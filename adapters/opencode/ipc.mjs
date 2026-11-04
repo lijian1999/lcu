@@ -50,7 +50,8 @@ export function ipcRequest(socketPath, message, { timeoutMs = 5_000 } = {}) {
  * Serve the newline-JSON protocol on `socketPath` (any stale file is removed first). A
  * connection's first line must carry the exact token; anything else is refused with one
  * error line and the connection is closed, as are malformed lines, oversized lines and
- * unknown message types. `handle(message)` returns the response object.
+ * unknown message types. `handle(message)` returns the response object. The socket file
+ * is left in place by `close` — the next owner unlinks it before listening again.
  */
 export function startIpcServer({ socketPath, token, handle, limit = IPC_REQUEST_LIMIT }) {
   if (typeof token !== 'string' || !token) throw new TypeError('A relay IPC token is required');
@@ -108,10 +109,12 @@ export function startIpcServer({ socketPath, token, handle, limit = IPC_REQUEST_
       resolve({
         server,
         socketPath,
-        close: () => new Promise(resolveClose => {
+        close: ({ force = true } = {}) => new Promise(resolveClose => {
           server.close(() => resolveClose());
-          // Do not let lingering plugin connections hold the relay's exit open.
-          server.closeAllConnections?.();
+          // Force (process exit) destroys lingering plugin connections so they cannot hold
+          // the exit open. A graceful close (the owner yielding mid-reply) keeps existing
+          // connections until they finish, so the step-down response is still delivered.
+          if (force) server.closeAllConnections?.();
         }),
       });
     });

@@ -87,6 +87,13 @@ export function createSessions({ limit = MAX_SESSIONS, randomUUID: makeTurnId = 
       return [...table.entries()].filter(([, state]) => state.open)
         .map(([sessionId, state]) => ({ sessionId, turnId: state.turnId, inFlight: state.inFlight }));
     },
+    /** Whether any session currently has a call in flight; the owner's gate for a yield. */
+    hasInFlight() {
+      for (const state of table.values()) {
+        if (state.inFlight > 0) return true;
+      }
+      return false;
+    },
     /** End every session's open turn; used after js_reset, which replaced the worker. */
     clearAllTurns() {
       for (const state of table.values()) state.open = false;
