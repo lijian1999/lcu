@@ -1,8 +1,8 @@
 # LCU × OpenCode 适配器设计文档
 
-- 版本：v0.2（草案，含第一阶段实测数据）
+- 版本：v0.3（草案，含第一、二阶段实测数据）
 - 日期：2026-11-04
-- 状态：设计阶段，未实现
+- 状态：设计阶段，未实现；E1/E2 实验已完成，结论推翻了 v0.2 的两个关键假设
 - 目标平台：macOS（Apple Silicon）优先；Linux 为后续扩展
 - 涉及组件：LCU 0.13.5、OpenCode Desktop 2.2.5（`ai.opencode.desktop`）、ChatGPT.app 26.1027.61615（CUA 0.0.35）
 
@@ -59,6 +59,93 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 | E4 | **MCP 连接是否多会话共享** | 开两个 OpenCode 会话并发调用，观测并发行为 |
 
 > 设计文档中标注 ⚠️E1/E2/E3/E4 的条目依赖上述实验结果。
+
+---
+
+## 2.2 第二阶段实测（2026-11-04 下午，OpenCode Desktop 2.2.5 / LCU 0.13.5 / ChatGPT 26.1027.51404）
+
+### 2.2.1 实验结果总览
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| **E1**（审批 elicitation 直达用户） | ❌ **失败** | OpenCode 静默自动接受 `elicitation/create`，用户全程看不到任何表单（详见 2.2.3） |
+| **E2**（截图 PNG 字节完整到达模型） | ✅ **通过** | 活动监视器截图 211,946 字节逐位到达模型，内容与 AX 树一致 |
+| **E3**（`_meta["ai.opencode/sessionID"]` 随调用到达） | ✅ 间接确认 | OpenCode 在 `tools/call` 携带该 `_meta`（opencode#51856 评论区抓包证实）；本次未在裸注册下直接复测 |
+| **E4**（MCP 连接多会话共享模型） | ⚠️ **比预期更糟** | OpenCode **按项目目录**各启动一个 lcu 服务器（非共享单连接），标签页关闭后进程不退出，直至 App 重启；多实例争抢单一 Sky 运行时（见 2.2.4） |
+
+### 2.2.2 排障过程记录（零窗口问题的真因链）
+
+第二阶段开局即复现第一阶段遗留的"全部 App 零窗口"。排障依次排除了四个假设，最终定位：
+
+1. ❌ **屏幕录制 TCC 授权对象错误**：`lcu doctor` 指明授权对象是 ChatGPT（录屏）+ Codex Computer Use helper（辅助功能），按签名身份归属。用户全部授权后依然零窗口。授权后**必须重启相关进程**（第一次"授权无效"即因未重启）。
+2. ❌ **Sky helper 进程陈旧**：helper（`Codex Computer Use.app`）在授权后为全新进程，排除。
+3. ✅（部分）**codex seatbelt 沙箱掐断 CGWindowList**：同一 Swift 探针（`CGWindowListCopyWindowInfo`），沙箱外 206 窗口，以 LCU worker 同款 `codex sandbox` 参数运行得 0 窗口——实锤。但注意：`LCU_NODE_REPL_SANDBOX` **仅 Linux 生效**（`runtime.mjs` 中 `if (target === 'linux')` 包裹），macOS 上是 no-op，写入该环境变量后零窗口依旧，与源码一致。
+4. ✅（最终）**零窗口本身是良性表象**：AX 读取（getApp/getAXState）、截图、控制动作全部正常——这些经 Sky helper（沙箱外、TCC 已授）中转；只有 worker 进程内的 CGWindowList 枚举被沙箱拦截，表现为 `listApps().windows` 全空。**对功能无实际影响，但适配器不应依赖 worker 内窗口枚举。**
+
+> 附带确认：`lcu apps` 输出为**已永久放行清单**（非已安装清单）。本机在测前已有 8 个 App 被放行（含 Finder、Chrome），来自 11-02 Pi 适配器会话的 `always` 持久化。
+
+### 2.2.3 E1 详细记录（本次实验核心产出）
+
+**现象**：对未放行 App（活动监视器 → Typora → 邮件）依次触发 `getApp` 绑定与控制动作（`performSecondaryAction(0, 'Raise')`），全部静默成功；用户全程（含专程盯屏复测）未见到任何审批 UI。用户主动关闭 OpenCode 的"自动接受权限"开关后复测，依旧无弹窗且成功。
+
+**判定实验**（独立 MCP 探针客户端，声明 elicitation 能力）：
+
+- 探针（无自动应答）对 Typora 发起同样调用 → 收到 `elicitation/create`（原文存 `/tmp/elicit_request_1.json`，要点如下），探针回答 `cancel` 后运行时正确 fail-closed（"Computer Use was not approved to use Typora"）：
+
+```json
+{
+  "message": "Allow Computer Use to use \"Typora\"?",
+  "mode": "form",
+  "requestedSchema": { "properties": {}, "type": "object" },
+  "_meta": {
+    "codex_approval_kind": "mcp_tool_call",
+    "connector_id": "computer-use",
+    "connector_name": "Computer Use",
+    "persist": ["session", "always"],
+    "riskLevel": "low",
+    "tool_name": "get_app_state",
+    "tool_params": { "app": "abnerworks.Typora" }
+  }
+}
+```
+
+- 对照组：OpenCode 会话内同调用 → 成功且无表单。
+
+**结论**：LCU 侧审批机制完好（发出、fail-closed、persist 语义齐全）；**OpenCode Desktop 2.2.5 的 MCP 客户端对 `elicitation/create` 静默回答 accept**，与"自动接受权限"开关无关，且 `requestedSchema` 为空 schema、不存在"应用默认值"的可能。与上游已知问题吻合（opencode#51856、#23066、#28567：OpenCode 声明 elicitation 能力但不向用户呈现 `mcp-elicitation` 类型表单；桌面版 `sessionFormRequest` 过滤只保留 `question`/`websearch.provider` 两种 kind；#58184 于 2026-10-22 关闭主 issue，但 Desktop 2.2.5 实测仍未呈现）。
+
+**对设计的推翻与修订**：
+
+- v0.2 §3.2/§5.4 的核心假设"OpenCode 原生呈现审批表单（E1）"**不成立**。中继不能把审批呈现寄托在 OpenCode 对 `elicitation` 的透传上。
+- 修订审批管线优先级：
+  1. **路线 1（首选）**：中继把审批映射为 OpenCode **`question` kind 的会话表单**（Desktop 确认会渲染该类型），需经插件的 session data API 创建，或在 relay 侧以 host 身份发起；对 `_meta.persist` 的"always"落库到 LCU 自身机制之外需另行设计（或仅支持 session 级）。
+  2. **路线 2**：跟踪上游 Desktop 对 `mcp-elicitation` 的呈现修复；一旦上游修复即切回透传（保留探针脚本作为回归用例）。
+  3. **路线 3（兜底，Junie 语义）**：中继对审批一律 cancel，并在工具结果中附提示块引导用户终端执行 `lcu apps allow <App>`（Touch ID）。
+- host-guard（D4）优先级提升：在审批不可信的宿主里，中继侧拒绝控制 OpenCode 自身成为必需而非加固。
+
+### 2.2.4 E4 详细记录（多会话并发）
+
+- OpenCode Desktop 为**每个打开的项目目录**各启动一份 lcu MCP 服务器（主页视图 = 主目录也算一份）；本机实测同时存在 2–3 份 `runtime.mjs`。
+- 标签页/会话关闭后其 MCP 进程**不退出**，直到 App 完全重启。多实例并发时互相断开对方的 Sky 连接（日志多次 `MCP server process exited`），表现为 js 内核内 `cua` 绑定随机丢失、调用间状态不稳定。
+- **对设计的修订**：v0.2 D3 假设"多会话共享同一中继进程、需会话互斥"，实际形态更根本——**中继必须以单例方式部署**（如全局固定路径 + 文件锁，或建议用户单会话使用），并把"检测到第二个中继实例"作为显式错误而非静默争抢。
+
+### 2.2.5 其他行为记录（适配器实现须绕开/处理）
+
+- **js 工具结果会被提前定稿**：`cua.getApp(...)` 的自动 AX 输出之后，同一调用内后续 `nodeRepl.write` 的内容不进入工具结果（疑似首条 emit 即定稿）。适配器文档须写明"绑定与取结果分开调用"的用法约定。
+- **审批后内核重置**：审批事件后 js 内核重置，`cua` 绑定丢失，需 `js_reset` 或重连恢复（多次复现）。
+- 顶层 `return` 非法（模块作用域），IIFE + `nodeRepl.write` 是可靠取值方式。
+- 中文 App 显示名解析失败（"访达"），须用 bundle ID（与文档一致）。
+- 运行时在工具结果中注入超长指南与"Confirmations Policy"文本（~19KB/次）：对模型上下文是持续税负，中继可评估缓存/裁剪（不得改变语义）。
+
+### 2.2.6 当前安全姿态（裸注册，诚实现状）
+
+在 E1 失效 + E4 并发争抢的现状下，裸注册的实际防线为：
+
+1. macOS TCC（录屏/辅助功能，已授 ChatGPT/Codex Computer Use/OpenCode）；
+2. OpenCode 工具调用批准（**当前会话未弹出过**，权限表为空，生效状态待新会话复测）；
+3. ~~LCU 逐应用审批~~（被宿主静默放行，失效）；
+4. LCU 运行时硬拒绝清单（Terminal/iTerm2 等）仍然有效。
+
+**在适配器路线 1/2/3 落地前，不应认为"AI 控制任意 App"有审批闸**。临时缓解：保持"自动接受权限"关闭；不用时退出敏感 App（注意 `getApp` 可后台拉起 App，此缓解不彻底）；等待/推进路线 1。
 
 ---
 
