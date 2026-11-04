@@ -2,7 +2,7 @@
 
 - 版本：v0.4（简化版裁定，含第一、二阶段实测数据）
 - 日期：2026-11-04
-- 状态：设计阶段，未实现；E1/E2 实验完成；用户裁定接受审批自动放行，审批呈现移出范围（§2.2.7），适配目标收敛为稳定性与防护
+- 状态：阶段 1–3 已实现并验收（relay `363923c`、plugin `69a07ed`、install `c13aa9b`，2026-11-04）；M4 文档部分完成（README + verification record），实机清单待 OpenCode 重启后执行（§8）
 - 目标平台：macOS（Apple Silicon）优先；Linux 为后续扩展
 - 涉及组件：LCU 0.13.5、OpenCode Desktop 2.2.5（`ai.opencode.desktop`）、ChatGPT.app 26.1027.61615（CUA 0.0.35）
 
@@ -420,10 +420,18 @@ LCU（amontlabs/lcu）把 Codex 的 computer-use 运行时从官方宿主中解�
 |------|------|------|------|
 | M0（已完成） | 裸注册 + 第一阶段实测 | 本文档 §2 | — |
 | M1（已完成，2026-11-04） | E1–E4 实验 | 本文档 §2.2（E1 失败裁定 → v0.4） | — |
-| M2 | Relay 核心（工具过滤 + 审批策略 + turn 管理 + 单例锁） | 可用的中继 + 单测 | 1 天 |
-| M3 | 插件 + 生命周期打通 | 完整轮次清理 | 0.5–1 天 |
-| M4 | 实机验证清单跑通 | verification record | 0.5 天 |
-| M5（可选） | 打包安装脚本 + PR 上游 | 发布物 | 0.5–1 天 |
+| M2（已完成，2026-11-04，`363923c`） | Relay 核心（工具过滤 + 审批策略 + turn 管理 + 单例锁） | `adapters/opencode/relay.mjs` + 单测 | 1 天 |
+| M3（已完成，2026-11-04，`69a07ed`；安装脚本随阶段 3 提前交付，`c13aa9b`） | 插件 + 生命周期打通 | `adapters/opencode/plugin/` + IPC 互操作验收 | 0.5–1 天 |
+| M4（文档完成，2026-11-04：`adapters/opencode/README.md` + `docs/verification/opencode-adapter-2026-11-04.md`；实机清单待 OpenCode 重启后执行） | 实机验证清单跑通 | verification record | 0.5 天 |
+| M5（部分完成：安装脚本已随阶段 3 交付，`c13aa9b`；PR 上游未开始） | 打包安装脚本 + PR 上游 | 发布物 | 0.5–1 天 |
+
+### 8.1 实现与设计的偏差（阶段 1–3 验收时记录）
+
+- 部署布局：安装脚本把中继 import 闭包**平铺**部署到 prefix 根，并把逃逸的 `../` 导入重写为同目录导入（§5.7 原设想保留 `<prefix>/adapters/opencode/` 的仓库目录结构）；部署前静态校验所有相对导入均在 prefix 内。
+- 插件零依赖：`@opencode/plugin` 的 `Plugin.define` 在 2.2.5 中是恒等函数（dist/promise/plugin.js），插件以裸对象导出，不安装该包。
+- standby 逐调用接管：standby 中继在每次 `tools/call` 时重试锁获取并原地升级为 owner（新 token、IPC、惰性上游），而非仅在启动时竞选一次（SPEC §1.1 步骤 4，设计文档未细化到该粒度）。
+- `instructions` 恒空：中继不透传上游初始化 instructions——`js` 描述符自带完整 cua_repl 指南，v0.4 接受该取舍（SPEC §1.2 原写"owner 已连上游时透传 `client.instructions`"）。
+- 审批策略签名：按 `client.mjs` 实际回调实现为 `onElicitation(params) => {action:'accept', content:{}}`（§5.4 伪码写作 `(params, {log})`；日志实例由中继闭包持有）。
 
 **合计：约 2–2.5 天**（v0.4 简化范围；原 3–4.5 天）。
 
